@@ -13,34 +13,37 @@ export default {
         // 🔍 管理员查询手机号验证记录（只读）
         // GET /admin/verify-log?mobile=138xxxx
         // ===============================
-        if (url.pathname === "/admin/verify-log" && request.method === "GET") {
-            const mobile = url.searchParams.get("mobile");
+        if (url.pathname === "/verify-phone" && request.method === "POST") {
+            const { mobile, verifyCode } = await request.json();
 
-            if (!mobile) {
+            if (!mobile || !verifyCode) {
                 return new Response(
-                    JSON.stringify({ error: "mobile required" }),
+                    JSON.stringify({ error: "missing params" }),
                     { status: 400 }
                 );
             }
 
-            const { results } = await env.DB.prepare(
-                `SELECT 
-                id,
-                mobile,
-                policy_id,
-                created_at,
-                verified,
-                verified_at
-             FROM phone_verify_log
-             WHERE mobile = ?
-             ORDER BY created_at DESC
-             LIMIT 5`
+            const record = await env.SMS_KV.get(mobile);
+
+            if (record !== verifyCode) {
+                await env.SMS_KV.delete(mobile);
+
+                return new Response(
+                    JSON.stringify({ error: "invalid code" }),
+                    { status: 403 }
+                );
+            }
+
+            await env.DB.prepare(
+                `UPDATE phone_verify_log
+               SET verified = 1, verified_at = CURRENT_TIMESTAMP
+               WHERE mobile = ? AND verify_code = ?`
             )
-                .bind(mobile)
-                .all();
+                .bind(mobile, verifyCode)
+                .run();
 
             return new Response(
-                JSON.stringify({ list: results }),
+                JSON.stringify({ verified: true }),
                 { headers: { "Content-Type": "application/json" } }
             );
         }
