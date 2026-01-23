@@ -1,7 +1,17 @@
-name = "xinhexin-api"
-main = "worker.js"
-compatibility_date = "2026-01-23"
+const API_BASE = 'https://xinhexin-api.chinalife-shiexinhexin.workers.dev';
 
-[[kv_namespaces]]
-binding = "SMS_KV"
-id = "487f5073f6be4ad6bc4f5380a9a16d14"
+export async function apiFetch(path: string, options: RequestInit = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    },
+    ...options
+  });
+
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}`);
+  }
+
+  return res.json();
+}
