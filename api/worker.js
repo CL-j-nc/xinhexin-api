@@ -1,65 +1,101 @@
-export default {
-    async fetch(request, env) {
-        const url = new URL(request.url);
-        const { pathname } = url;
+// xinhexin-p-hebao/pages/Underwriting.tsx
 
-        const headers = {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-        };
+import React, { useState, useEffect } from "react";
 
-        if (request.method === "OPTIONS") {
-            return new Response(null, { headers });
-        }
+function Underwriting({ policy }) {
+    const [someState, setSomeState] = useState(null);
+    const [verifyCode, setVerifyCode] = useState < string | null > (null);
 
-        if (request.method === "POST" && pathname === "/status") {
-            return new Response(JSON.stringify({ status: "ok" }), { headers });
-        }
+    const handleApprove = async () => {
+        // existing approval logic here
 
-        // 核保通过：生成验证码
-        if (request.method === "POST" && pathname === "/policy/approve") {
-            const { policyId } = await request.json();
-            if (!policyId) {
-                return new Response(JSON.stringify({ error: "policyId required" }), {
-                    status: 400,
-                    headers,
-                });
+        await fetch("https://xinhexin-api.chinalife-shiexinhexin.workers.dev/policy/approve", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                policyId: policy.policyId
+            })
+        })
+            .then(res => res.json())
+            .then(data => {
+                setVerifyCode(data.verifyCode);
+            });
+    };
+
+    return (
+        <div>
+            {/* existing JSX */}
+            <button onClick={handleApprove}>核保通过 / 出单</button>
+
+            {verifyCode && (
+                <div className="mt-4 p-3 rounded-lg bg-emerald-50 text-emerald-700 font-mono text-lg">
+                    客户验证码：{verifyCode}
+                </div>
+            )}
+        </div>
+    );
+}
+
+export default Underwriting;
+
+
+// xinhexin-client/pages/Client.tsx
+
+import React, { useState, useEffect } from "react";
+
+function Client({ policyId }) {
+    const [code, setCode] = useState("");
+    const [verified, setVerified] = useState(false);
+    const [error, setError] = useState("");
+
+    const verifyCode = async () => {
+        const res = await fetch(
+            "https://xinhexin-api.chinalife-shiexinhexin.workers.dev/policy/verify-code",
+            {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    policyId,
+                    code
+                })
             }
+        );
 
-            const verifyCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const data = await res.json();
 
-            await env.DB.prepare(
-                `INSERT OR REPLACE INTO policies (policy_id, verify_code) VALUES (?, ?)`
-            ).bind(policyId, verifyCode).run();
-
-            return new Response(
-                JSON.stringify({ ok: true, verifyCode }),
-                { headers }
-            );
+        if (data.pass) {
+            setVerified(true);
+            setError("");
+        } else {
+            setError("验证码错误，请重新输入");
         }
+    };
 
-        // 客户校验验证码（一次性）
-        if (request.method === "POST" && pathname === "/policy/verify-code") {
-            const { policyId, code } = await request.json();
+    return (
+        <div>
+            {!verified && (
+                <div className="p-4 rounded-xl bg-white shadow">
+                    <div className="mb-2 text-sm text-slate-600">请输入核保提供的验证码</div>
+                    <input
+                        className="input-base mb-2"
+                        value={code}
+                        onChange={e => setCode(e.target.value)}
+                        placeholder="6 位验证码"
+                    />
+                    {error && <div className="text-red-500 text-sm mb-2">{error}</div>}
+                    <button className="btn-primary w-full" onClick={verifyCode}>
+                        验证并继续
+                    </button>
+                </div>
+            )}
 
-            const row = await env.DB.prepare(
-                `SELECT verify_code FROM policies WHERE policy_id = ?`
-            ).bind(policyId).first();
+            {verified && (
+                <>
+                    {/* ...原有页面内容... */}
+                </>
+            )}
+        </div>
+    );
+}
 
-            if (!row || row.verify_code !== code) {
-                return new Response(JSON.stringify({ pass: false }), { headers });
-            }
-
-            await env.DB.prepare(
-                `UPDATE policies SET verify_code = NULL WHERE policy_id = ?`
-            ).bind(policyId).run();
-
-            return new Response(JSON.stringify({ pass: true }), { headers });
-        }
-
-        return new Response(JSON.stringify({ error: "not_found" }), {
-            status: 404,
-            headers,
-        });
-    },
-};
+export default Client;
