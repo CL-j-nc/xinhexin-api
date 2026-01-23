@@ -32,6 +32,7 @@ export interface VehicleInfo {
     vin: string;
     engineNo: string;
     brand: string;
+    owner: string;
     registerDate: string;
     vehicleType: string;
     useNature: string;

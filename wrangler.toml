@@ -1,10 +1,50 @@
-name = "jhpcic-api"
-main = "worker.js"
-compatibility_date = "2025-01-01"
+export interface PersonInfo {
+  name: string;
+  idType: string;
+  idCard: string;
+  mobile: string;
+  address: string;
+  idImage?: string;
+  principalName?: string;
+  principalIdCard?: string;
+  principalAddress?: string;
+  principalIdImage?: string;
+}
 
-kv_namespaces = [
-  { binding = "JHPCIC_KV", id = "REPLACE_WITH_KV_ID" }
-]
+export interface VehicleInfo {
+  plate: string;
+  vin: string;
+  engineNo: string;
+  brand: string;
+  owner: string;
+  registerDate: string;
+  vehicleType?: string;
+  useNature?: string;
+  curbWeight: string;
+  approvedLoad: string;
+  approvedPassengers: string;
+  licenseImage?: string;
+}
 
-[vars]
-ENV = "production"
+export interface CoverageItem {
+  type: string;
+  level: string;
+  amount?: number;
+}
+
+export interface InsuranceData {
+  policyId?: string;
+  status?: string;
+  insuranceOwner?: PersonInfo;
+  proposer: PersonInfo;
+  insured: PersonInfo;
+  vehicle: VehicleInfo;
+  coverages: CoverageItem[];
+  underwritingInfo?: {
+    rejectReason?: string;
+    payment?: {
+      alipayQr?: string;
+    };
+    contractToken?: string;
+  };
+}
