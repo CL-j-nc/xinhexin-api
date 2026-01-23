@@ -2,5 +2,5 @@ name = "xinhexin-api"
 main = "worker.js"
 compatibility_date = "2024-12-01"
 
-[vars]
-ENV = "prod"
+[[kv_namespaces]]
+binding = "487f5073f6be4ad6bc4f5380a9a16d14"
