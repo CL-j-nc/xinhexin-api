@@ -4,9 +4,10 @@ compatibility_date = "2024-12-01"
 
 workers_dev = true
 
+
 [[kv_namespaces]]
-binding = "SMS_KV"
-id = "487f5073f6be4ad6bc4f5380a9a16d14"
+binding = "POLICY_KV"
+id = "8687c597a13548f58c7236090ad56287"
 
 [[d1_databases]]
 binding = "DB"
