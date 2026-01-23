@@ -1,50 +1,6 @@
-export interface PersonInfo {
-  name: string;
-  idType: string;
-  idCard: string;
-  mobile: string;
-  address: string;
-  idImage?: string;
-  principalName?: string;
-  principalIdCard?: string;
-  principalAddress?: string;
-  principalIdImage?: string;
-}
+name = "xinhexin-api"
+main = "worker.js"
+compatibility_date = "2024-12-01"
 
-export interface VehicleInfo {
-  plate: string;
-  vin: string;
-  engineNo: string;
-  brand: string;
-  owner: string;
-  registerDate: string;
-  vehicleType?: string;
-  useNature?: string;
-  curbWeight: string;
-  approvedLoad: string;
-  approvedPassengers: string;
-  licenseImage?: string;
-}
-
-export interface CoverageItem {
-  type: string;
-  level: string;
-  amount?: number;
-}
-
-export interface InsuranceData {
-  policyId?: string;
-  status?: string;
-  insuranceOwner?: PersonInfo;
-  proposer: PersonInfo;
-  insured: PersonInfo;
-  vehicle: VehicleInfo;
-  coverages: CoverageItem[];
-  underwritingInfo?: {
-    rejectReason?: string;
-    payment?: {
-      alipayQr?: string;
-    };
-    contractToken?: string;
-  };
-}
+[vars]
+ENV = "prod"
