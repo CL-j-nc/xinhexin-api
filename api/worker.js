@@ -10,45 +10,6 @@ export default {
         }
 
         // ===============================
-        // 🔍 管理员查询手机号验证记录（只读）
-        // GET /admin/verify-log?mobile=138xxxx
-        // ===============================
-        if (url.pathname === "/verify-phone" && request.method === "POST") {
-            const { mobile, verifyCode } = await request.json();
-
-            if (!mobile || !verifyCode) {
-                return new Response(
-                    JSON.stringify({ error: "missing params" }),
-                    { status: 400 }
-                );
-            }
-
-            const record = await env.SMS_KV.get(mobile);
-
-            if (record !== verifyCode) {
-                await env.SMS_KV.delete(mobile);
-
-                return new Response(
-                    JSON.stringify({ error: "invalid code" }),
-                    { status: 403 }
-                );
-            }
-
-            await env.DB.prepare(
-                `UPDATE phone_verify_log
-               SET verified = 1, verified_at = CURRENT_TIMESTAMP
-               WHERE mobile = ? AND verify_code = ?`
-            )
-                .bind(mobile, verifyCode)
-                .run();
-
-            return new Response(
-                JSON.stringify({ verified: true }),
-                { headers: { "Content-Type": "application/json" } }
-            );
-        }
-
-        // ===============================
         // 1️⃣ 生成验证码（防刷 + D1 记录）
         // ===============================
         if (url.pathname === "/generate-code" && request.method === "POST") {
@@ -111,10 +72,10 @@ export default {
 
             const record = await env.SMS_KV.get(mobile);
             if (record !== verifyCode) {
+                await env.SMS_KV.delete(mobile);
                 return new Response(
                     JSON.stringify({ error: "invalid code" }),
-                    await env.SMS_KV.delete(mobile);
-                { status: 403 }
+                    { status: 403 }
                 );
             }
 
