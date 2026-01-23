@@ -1,17 +1,8 @@
-const API_BASE = 'https://xinhexin-api.chinalife-shiexinhexin.workers.dev';
+name = "xinhexin-api"
+main = "api/worker.js"
+compatibility_date = "2026-01-23"
 
-export async function apiFetch(path: string, options: RequestInit = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    },
-    ...options
-  });
-
-  if (!res.ok) {
-    throw new Error(`API error ${res.status}`);
-  }
-
-  return res.json();
-}
+[[d1_databases]]
+binding = "DB"
+database_name = "xinhexin_prod"
+database_id = "21c12c35-e953-4c36-a728-8ecec42b5e7c"
