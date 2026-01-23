@@ -2,101 +2,99 @@ export default {
     async fetch(request, env) {
         const url = new URL(request.url);
 
-        // health
-        if (url.pathname === "/status" && request.method === "GET") {
-            return new Response(JSON.stringify({ status: "ok" }), {
-                headers: { "Content-Type": "application/json" },
-            });
+        // ===== CORS 预检 =====
+        if (request.method === 'OPTIONS') {
+            return new Response(null, { status: 204, headers: cors() });
         }
 
-        // ===============================
-        // 1️⃣ 生成验证码（防刷 + D1 记录）
-        // ===============================
-        if (url.pathname === "/generate-code" && request.method === "POST") {
-            const { mobile, policyId } = await request.json();
-
-            if (!mobile) {
-                return new Response(
-                    JSON.stringify({ error: "mobile required" }),
-                    { status: 400 }
-                );
-            }
-
-            // 防刷：5 分钟 1 次
-            const last = await env.SMS_KV.get(`LIMIT:${mobile}`);
-            if (last) {
-                return new Response(
-                    JSON.stringify({ error: "too many requests" }),
-                    { status: 429 }
-                );
-            }
-
-            // 生成 6 位验证码
-            const code = Math.floor(100000 + Math.random() * 900000).toString();
-
-            // KV：验证码 5 分钟
-            await env.SMS_KV.put(mobile, code, { expirationTtl: 300 });
-
-            // KV：防刷标记
-            await env.SMS_KV.put(`LIMIT:${mobile}`, "1", { expirationTtl: 300 });
-
-            // D1 记录
-            await env.DB.prepare(
-                `INSERT INTO phone_verify_log (mobile, policy_id, verify_code)
-           VALUES (?, ?, ?)`
-            )
-                .bind(mobile, policyId || null, code)
-                .run();
-
-            return new Response(
-                JSON.stringify({
-                    mobile,
-                    verifyCode: code
-                }),
-                { headers: { "Content-Type": "application/json" } }
-            );
+        // ===== 健康检查 =====
+        if (url.pathname === '/status') {
+            return json({ status: 'ok' });
         }
 
-        // ===============================
-        // 2️⃣ 校验验证码（更新 D1）
-        // ===============================
-        if (url.pathname === "/verify-phone" && request.method === "POST") {
-            const { mobile, verifyCode } = await request.json();
+        // ===== 提交投保 / 生成保单 =====
+        if (url.pathname === '/api/policies' && request.method === 'POST') {
+            try {
+                const policy = await request.json();
 
-            if (!mobile || !verifyCode) {
-                return new Response(
-                    JSON.stringify({ error: "missing params" }),
-                    { status: 400 }
+                // === 极简必要校验（防空壳）===
+                if (!policy.policyHolder || !policy.vehicle || !policy.coverages) {
+                    return json({ error: 'missing_core_fields' }, 400);
+                }
+
+                const policyNo = generatePolicyNo();
+                const now = new Date().toISOString();
+
+                const record = {
+                    policyNo,
+                    createdAt: now,
+                    status: 'SUBMITTED', // 已提交，可直接制单
+                    data: policy,
+                };
+
+                // === 持久化（KV）===
+                await env.POLICY_KV.put(
+                    `policy:${policyNo}`,
+                    JSON.stringify(record),
+                    { expirationTtl: 60 * 60 * 24 * 365 } // 1 年
                 );
+
+                return json({
+                    success: true,
+                    policyNo,
+                    createdAt: now,
+                });
+            } catch (e) {
+                return json({ error: 'invalid_json' }, 400);
             }
-
-            const record = await env.SMS_KV.get(mobile);
-            if (record !== verifyCode) {
-                await env.SMS_KV.delete(mobile);
-                return new Response(
-                    JSON.stringify({ error: "invalid code" }),
-                    { status: 403 }
-                );
-            }
-
-            // 更新 D1
-            await env.DB.prepare(
-                `UPDATE phone_verify_log
-           SET verified = 1, verified_at = CURRENT_TIMESTAMP
-           WHERE mobile = ? AND verify_code = ?`
-            )
-                .bind(mobile, verifyCode)
-                .run();
-
-            return new Response(
-                JSON.stringify({ verified: true }),
-                { headers: { "Content-Type": "application/json" } }
-            );
         }
 
-        return new Response(
-            JSON.stringify({ error: "not_found" }),
-            { status: 404 }
-        );
-    }
+        // ===== 查询保单（制单 / 打印用）=====
+        if (url.pathname === '/api/policies/get' && request.method === 'GET') {
+            const policyNo = url.searchParams.get('policyNo');
+            if (!policyNo) {
+                return json({ error: 'policyNo_required' }, 400);
+            }
+
+            const raw = await env.POLICY_KV.get(`policy:${policyNo}`);
+            if (!raw) {
+                return json({ error: 'policy_not_found' }, 404);
+            }
+
+            return json(JSON.parse(raw));
+        }
+
+        // ===== 未命中 =====
+        return json({ error: 'not_found' }, 404);
+    },
 };
+
+// ================= 工具函数 =================
+
+function json(data, status = 200) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: {
+            'Content-Type': 'application/json',
+            ...cors(),
+        },
+    });
+}
+
+function cors() {
+    return {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+    };
+}
+
+function generatePolicyNo() {
+    const d = new Date();
+    const ymd =
+        d.getFullYear().toString() +
+        String(d.getMonth() + 1).padStart(2, '0') +
+        String(d.getDate()).padStart(2, '0');
+
+    return `CLPC-${ymd}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
