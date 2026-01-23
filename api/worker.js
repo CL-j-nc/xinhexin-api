@@ -10,6 +10,42 @@ export default {
         }
 
         // ===============================
+        // 🔍 管理员查询手机号验证记录（只读）
+        // GET /admin/verify-log?mobile=138xxxx
+        // ===============================
+        if (url.pathname === "/admin/verify-log" && request.method === "GET") {
+            const mobile = url.searchParams.get("mobile");
+
+            if (!mobile) {
+                return new Response(
+                    JSON.stringify({ error: "mobile required" }),
+                    { status: 400 }
+                );
+            }
+
+            const { results } = await env.DB.prepare(
+                `SELECT 
+                id,
+                mobile,
+                policy_id,
+                created_at,
+                verified,
+                verified_at
+             FROM phone_verify_log
+             WHERE mobile = ?
+             ORDER BY created_at DESC
+             LIMIT 5`
+            )
+                .bind(mobile)
+                .all();
+
+            return new Response(
+                JSON.stringify({ list: results }),
+                { headers: { "Content-Type": "application/json" } }
+            );
+        }
+
+        // ===============================
         // 1️⃣ 生成验证码（防刷 + D1 记录）
         // ===============================
         if (url.pathname === "/generate-code" && request.method === "POST") {
@@ -74,7 +110,8 @@ export default {
             if (record !== verifyCode) {
                 return new Response(
                     JSON.stringify({ error: "invalid code" }),
-                    { status: 403 }
+                    await env.SMS_KV.delete(mobile);
+                { status: 403 }
                 );
             }
 
