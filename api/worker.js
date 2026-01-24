@@ -240,6 +240,32 @@ export default {
             return json(list);
         }
 
+
+        // =====================================================
+        // 📱 手机验证码（由核保端生成）
+        // =====================================================
+        if (url.pathname === "/api/verify/send" && request.method === "POST") {
+            const { applicationNo } = await request.json();
+            const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+            await env.POLICY_KV.put(
+                `verify:${applicationNo}`,
+                JSON.stringify({ code, at: nowISO() }),
+                { expirationTtl: 300 }
+            );
+
+            return json({ success: true, code });
+        }
+
+        if (url.pathname === "/api/verify/check" && request.method === "POST") {
+            const { applicationNo, code } = await request.json();
+            const raw = await env.POLICY_KV.get(`verify:${applicationNo}`);
+            if (!raw) return json({ success: false }, 400);
+
+            const saved = JSON.parse(raw);
+            return json({ success: saved.code === code });
+        }
+
         return json({ error: 'not_found' }, 404);
     }
 };
