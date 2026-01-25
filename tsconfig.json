@@ -1,7 +1,15 @@
 {
   "compilerOptions": {
-    "types": [
-      "@cloudflare/workers-types"
-    ]
-  }
+    "target": "esnext",
+    "module": "esnext",
+    "lib": ["esnext"],
+    "strict": true,
+    "esModuleInterop": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["src", "api", "utils", "store", "types"]
 }

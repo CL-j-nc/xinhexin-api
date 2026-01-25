@@ -8,7 +8,7 @@
  * - 不允许被前端 import
  */
 
-const API_KEY = (globalThis as any).API_KEY || process.env.API_KEY;
+const API_KEY = (globalThis as any).API_KEY;
 
 if (!API_KEY) {
     throw new Error('AI API_KEY is not configured');

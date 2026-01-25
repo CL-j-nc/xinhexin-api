@@ -1,0 +1,13 @@
+{
+  "name": "xinhexin-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "API for xinhexin",
+  "scripts": {
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240529.0",
+    "typescript": "^5.2.2"
+  }
+}
