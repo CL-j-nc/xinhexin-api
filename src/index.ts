@@ -1,3 +1,10 @@
+import { handleCRMRoutes } from "./api/crm";
+import { handlePolicyRoutes } from "./api/policy";
+import { handleClaimReportRoutes } from "./api/claim-report";
+import { handleClaimProcessRoutes } from "./api/claim-process";
+import { handleDocumentCenterRoutes } from "./api/document-center";
+import { handleCustomerServiceRoutes } from "./api/customer-service";
+
 export interface Env {
   DB: D1Database;
   POLICY_KV: KVNamespace;
@@ -22,6 +29,188 @@ export default {
     }
 
     try {
+      // CRM API 路由
+      const crmResponse = await handleCRMRoutes(request, env, pathname);
+      if (crmResponse) return crmResponse;
+
+      // 保单服务中心路由
+      const policyResponse = await handlePolicyRoutes(request, env, pathname);
+      if (policyResponse) return policyResponse;
+
+      // 报案中心路由
+      const claimReportResponse = await handleClaimReportRoutes(request, env, pathname);
+      if (claimReportResponse) return claimReportResponse;
+
+      // 理赔中心路由
+      const claimProcessResponse = await handleClaimProcessRoutes(request, env, pathname);
+      if (claimProcessResponse) return claimProcessResponse;
+
+      // 文档中心路由
+      const documentResponse = await handleDocumentCenterRoutes(request, env, pathname);
+      if (documentResponse) return documentResponse;
+
+      // 客服中心路由
+      const customerServiceResponse = await handleCustomerServiceRoutes(request, env, pathname);
+      if (customerServiceResponse) return customerServiceResponse;
+
+      // ==================== NEW UNDERWRITING FLOW ====================
+
+      // 1. Submit Proposal (Replaces /api/application/apply)
+      // POST /api/proposal/submit
+      if (pathname === "/api/proposal/submit" && request.method === "POST") {
+        const payload = await request.json() as any;
+
+        // 1. Generate IDs
+        const proposalId = `PROP-${crypto.randomUUID()}`;
+        const vehicleId = `VEH-${crypto.randomUUID()}`;
+        const nowStr = now();
+
+        // 2. Insert into proposal
+        await env.DB.prepare(
+          `INSERT INTO proposal (proposal_id, proposal_status, created_at, updated_at) VALUES (?, 'SUBMITTED', ?, ?)`
+        ).bind(proposalId, nowStr, nowStr).run();
+
+        // 3. Insert into vehicle_proposed
+        const v = payload.vehicle || {};
+        await env.DB.prepare(
+          `INSERT INTO vehicle_proposed (
+               vehicle_id, proposal_id, plate_number, vehicle_type, usage_nature, brand_model, 
+               vin_chassis_number, engine_number, registration_date, license_issue_date, 
+               curb_weight, approved_load_weight, approved_passenger_count, energy_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          vehicleId, proposalId, v.plate, v.vehicleType, v.useNature, v.brand,
+          v.vin, v.engineNo, v.registerDate, v.issueDate,
+          v.curbWeight, v.approvedLoad, v.seats, payload.energyType
+        ).run();
+
+        // Return success with IDs
+        return jsonResponse({ success: true, proposalId });
+      }
+
+      // 2. Get Pending Proposals for Underwriter
+      // GET /api/underwriting/pending
+      if (pathname === "/api/underwriting/pending" && request.method === "GET") {
+        const { results } = await env.DB.prepare(
+          `SELECT p.proposal_id, p.proposal_status, p.created_at, v.vehicle_type, v.plate_number, v.brand_model 
+           FROM proposal p
+           LEFT JOIN vehicle_proposed v ON p.proposal_id = v.proposal_id
+           WHERE p.proposal_status = 'SUBMITTED'
+           ORDER BY p.created_at DESC`
+        ).all();
+        return jsonResponse(results || []);
+      }
+
+      // 3. Get Proposal Detail for Underwriter
+      // GET /api/underwriting/detail
+      if (pathname === "/api/underwriting/detail" && request.method === "GET") {
+        const id = url.searchParams.get("id");
+        if (!id) return jsonResponse({ error: "Missing id" }, 400);
+
+        const proposal = await env.DB.prepare("SELECT * FROM proposal WHERE proposal_id = ?").bind(id).first<any>();
+        if (!proposal) return jsonResponse({ error: "Not found" }, 404);
+
+        const vehicle = await env.DB.prepare("SELECT * FROM vehicle_proposed WHERE proposal_id = ?").bind(id).first<any>();
+
+        return jsonResponse({ proposal, vehicle });
+      }
+
+      // 4. Submit Underwriting Decision
+      // POST /api/underwriting/decide
+      if (pathname === "/api/underwriting/decide" && request.method === "POST") {
+        const payload = await request.json() as any;
+        const { proposalId, decision, vehicleConfirmed, underwriterName } = payload;
+        // decision: { riskLevel, riskReason, acceptance, finalPremium, ... }
+
+        if (!proposalId || !decision) return jsonResponse({ error: "Missing data" }, 400);
+
+        // A. Insert Manual Decision
+        const decisionId = `DEC-${crypto.randomUUID()}`;
+        await env.DB.prepare(`
+          INSERT INTO underwriting_manual_decision (
+            decision_id, proposal_id, 
+            underwriting_risk_level, underwriting_risk_reason, underwriting_risk_acceptance,
+            usage_authenticity_judgment, usage_verification_basis,
+            loss_history_estimation, loss_history_basis, ncd_assumption,
+            final_premium, premium_adjustment_reason,
+            coverage_adjustment_flag, coverage_adjustment_detail,
+            special_exception_flag, special_exception_description,
+            underwriter_name, underwriter_id, underwriting_confirmed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          decisionId, proposalId,
+          decision.riskLevel, decision.riskReason, decision.acceptance,
+          decision.usageJudgment || "N/A", decision.usageBasis || "N/A",
+          decision.lossHistory || "N/A", decision.lossBasis || "N/A", decision.ncd || "N/A",
+          decision.finalPremium, decision.premiumReason || "N/A",
+          decision.coverageFlag || 0, decision.coverageDetail || "",
+          decision.exceptionFlag || 0, decision.exceptionDesc || "",
+          underwriterName || "System", "U001", now()
+        ).run();
+
+        // B. Insert Underwritten Vehicle (Confirmed values)
+        if (vehicleConfirmed) {
+          const vId = `V-UND-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+             INSERT INTO vehicle_underwritten (
+               underwritten_vehicle_id, proposal_id,
+               plate_number, vehicle_type, usage_nature, brand_model,
+               vin_chassis_number, engine_number,
+               curb_weight, approved_load_weight, approved_passenger_count, energy_type
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           `).bind(
+            vId, proposalId,
+            vehicleConfirmed.plate, vehicleConfirmed.vehicleType, vehicleConfirmed.useNature, vehicleConfirmed.brand,
+            vehicleConfirmed.vin, vehicleConfirmed.engineNo,
+            vehicleConfirmed.curbWeight, vehicleConfirmed.approvedLoad, vehicleConfirmed.seats, vehicleConfirmed.energyType
+          ).run();
+        }
+
+        // C. Update Proposal Status
+        const newStatus = decision.acceptance === "ACCEPT" ? "APPROVED" : "REJECTED";
+        await env.DB.prepare("UPDATE proposal SET proposal_status = ?, updated_at = ? WHERE proposal_id = ?")
+          .bind(newStatus, now(), proposalId).run();
+
+        // D. (Optional) Create Policy if Approved
+        // Per instruction: "Policy table (Only recognizing underwriting result)"
+        if (newStatus === "APPROVED") {
+          const policyId = `POL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+             INSERT INTO policy (
+               policy_id, proposal_id, policy_status, 
+               policy_issue_date, policy_effective_date, policy_expiry_date,
+               final_premium, underwriter_name
+             ) VALUES (?, ?, 'EFFECTIVE', ?, ?, ?, ?, ?)
+           `).bind(
+            policyId, proposalId,
+            now(), now(), "2027-01-01T00:00:00Z", // Simplified expiry
+            decision.finalPremium, underwriterName || "System"
+          ).run();
+        }
+
+        return jsonResponse({ success: true, decisionId });
+      }
+
+      // 2. Get Proposal Status (For UI polling)
+      // GET /api/proposal/status?id=xxx
+      if (pathname === "/api/proposal/status" && request.method === "GET") {
+        const id = url.searchParams.get("id");
+        if (!id) return jsonResponse({ error: "Missing id" }, 400);
+
+        const result = await env.DB.prepare(
+          `SELECT * FROM proposal WHERE proposal_id = ?`
+        ).bind(id).first<any>();
+
+        if (!result) return jsonResponse({ error: "Not found" }, 404);
+
+        // TODO: Join with underwriting_manual_decision if status is processed
+        return jsonResponse({
+          status: result.proposal_status,
+          proposalId: result.proposal_id
+        });
+      }
+
+      // ==================== LEGACY ROUTES (KEEPING FOR COMPATIBILITY IF NEEDED) ====================
       if (pathname === "/api/upload" && request.method === "POST") {
         const formData = await request.formData();
         const fileValue = formData.get("file");
@@ -33,7 +222,14 @@ export default {
         return jsonResponse({ fileId });
       }
 
+      // Forward legacy apply to new flow logic or keep separate?
+      // Instruction: "API is fact and flow hub... no automatic underwriting"
+      // I will keep legacy routes pointing to old tables for safety if user rolls back app, 
+      // BUT mapped routes above take precedence.
+      // Since I added "/api/proposal/submit", the Salesman app needs to use THIS new endpoint.
+
       if (pathname === "/api/application/apply" && request.method === "POST") {
+        // ... (Old logic kept for legacy apps not yet updated)
         const { data, files } = await parseApplyPayload(request, env);
         const applicationNo = await insertApplication(env, data, files);
         const requestId = `REQ-${crypto.randomUUID()}`;
