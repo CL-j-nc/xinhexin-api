@@ -1,4 +1,4 @@
-CREATE TABLE application (
+CREATE TABLE IF NOT EXISTS application (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   application_no TEXT UNIQUE,
   data TEXT,
