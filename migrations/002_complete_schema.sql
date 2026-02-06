@@ -50,8 +50,8 @@ CREATE TABLE IF NOT EXISTS application (
   -- 验证码 (客户端查询用)
   verify_code TEXT
 );
-CREATE INDEX idx_application_status ON application(status);
-CREATE INDEX idx_application_no ON application(application_no);
+CREATE INDEX IF NOT EXISTS idx_application_status ON application(status);
+CREATE INDEX IF NOT EXISTS idx_application_no ON application(application_no);
 -- ==================== 保单表 ====================
 -- 承保成功后生成的正式保单
 CREATE TABLE IF NOT EXISTS policy (
@@ -99,10 +99,10 @@ CREATE TABLE IF NOT EXISTS policy (
   lapsed_at DATETIME,
   FOREIGN KEY (application_no) REFERENCES application(application_no)
 );
-CREATE INDEX idx_policy_no ON policy(policy_no);
-CREATE INDEX idx_policy_plate ON policy(plate);
-CREATE INDEX idx_policy_owner ON policy(owner_name, owner_id_card);
-CREATE INDEX idx_policy_status ON policy(status);
+CREATE INDEX IF NOT EXISTS idx_policy_no ON policy(policy_no);
+CREATE INDEX IF NOT EXISTS idx_policy_plate ON policy(plate);
+CREATE INDEX IF NOT EXISTS idx_policy_owner ON policy(owner_name, owner_id_card);
+CREATE INDEX IF NOT EXISTS idx_policy_status ON policy(status);
 -- ==================== 批改保全表 ====================
 -- 保单生效后的变更记录
 CREATE TABLE IF NOT EXISTS endorsement (
@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS endorsement (
   processor_id TEXT,
   FOREIGN KEY (policy_no) REFERENCES policy(policy_no)
 );
-CREATE INDEX idx_endorsement_policy ON endorsement(policy_no);
+CREATE INDEX IF NOT EXISTS idx_endorsement_policy ON endorsement(policy_no);
 -- ==================== CRM 车辆档案表 ====================
 CREATE TABLE IF NOT EXISTS vehicle_crm_profile (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,8 +184,8 @@ CREATE TABLE IF NOT EXISTS vehicle_crm_profile (
   usage_count INTEGER DEFAULT 0,
   is_favorite BOOLEAN DEFAULT 0
 );
-CREATE INDEX idx_crm_vehicle_plate ON vehicle_crm_profile(plate);
-CREATE INDEX idx_crm_vehicle_vin ON vehicle_crm_profile(vin);
+CREATE INDEX IF NOT EXISTS idx_crm_vehicle_plate ON vehicle_crm_profile(plate);
+CREATE INDEX IF NOT EXISTS idx_crm_vehicle_vin ON vehicle_crm_profile(vin);
 -- ==================== CRM 客户联系人表 ====================
 CREATE TABLE IF NOT EXISTS vehicle_crm_contacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS vehicle_crm_contacts (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (vehicle_policy_uid) REFERENCES vehicle_crm_profile(vehicle_policy_uid)
 );
-CREATE INDEX idx_crm_contact_vehicle ON vehicle_crm_contacts(vehicle_policy_uid);
+CREATE INDEX IF NOT EXISTS idx_crm_contact_vehicle ON vehicle_crm_contacts(vehicle_policy_uid);
 -- ==================== CRM 续保提醒表 ====================
 CREATE TABLE IF NOT EXISTS renewal_reminder (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,8 +232,8 @@ CREATE TABLE IF NOT EXISTS renewal_reminder (
   sent_at DATETIME,
   FOREIGN KEY (vehicle_policy_uid) REFERENCES vehicle_crm_profile(vehicle_policy_uid)
 );
-CREATE INDEX idx_renewal_date ON renewal_reminder(reminder_date);
-CREATE INDEX idx_renewal_status ON renewal_reminder(status);
+CREATE INDEX IF NOT EXISTS idx_renewal_date ON renewal_reminder(reminder_date);
+CREATE INDEX IF NOT EXISTS idx_renewal_status ON renewal_reminder(status);
 -- ==================== 查询日志表 ====================
 -- 记录客户/业务员查询保单的历史
 CREATE TABLE IF NOT EXISTS query_log (
@@ -253,4 +253,4 @@ CREATE TABLE IF NOT EXISTS query_log (
   result_count INTEGER DEFAULT 0,
   queried_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_query_log_time ON query_log(queried_at);
+CREATE INDEX IF NOT EXISTS idx_query_log_time ON query_log(queried_at);

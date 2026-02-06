@@ -95,6 +95,6 @@ CREATE TABLE IF NOT EXISTS policy (
   FOREIGN KEY (proposal_id) REFERENCES proposal(proposal_id)
 );
 -- Index creation for performance
-CREATE INDEX idx_proposal_status ON proposal(proposal_status);
-CREATE INDEX idx_vehicle_proposed_plate ON vehicle_proposed(plate_number);
-CREATE INDEX idx_vehicle_proposed_vin ON vehicle_proposed(vin_chassis_number);
+CREATE INDEX IF NOT EXISTS idx_proposal_status ON proposal(proposal_status);
+CREATE INDEX IF NOT EXISTS idx_vehicle_proposed_plate ON vehicle_proposed(plate_number);
+CREATE INDEX IF NOT EXISTS idx_vehicle_proposed_vin ON vehicle_proposed(vin_chassis_number);

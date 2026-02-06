@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS vehicle_crm_contacts (
   FOREIGN KEY (vehicle_policy_uid) REFERENCES vehicle_insurance_master(vehicle_policy_uid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_crm_contacts_policy ON vehicle_crm_contacts(vehicle_policy_uid);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_contacts_policy ON vehicle_crm_contacts(vehicle_policy_uid);
 
 -- 3. CRM 时间轴表 (承保/服务事件)
 CREATE TABLE IF NOT EXISTS vehicle_crm_timeline (
@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS vehicle_crm_timeline (
   FOREIGN KEY (vehicle_policy_uid) REFERENCES vehicle_insurance_master(vehicle_policy_uid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_crm_timeline_policy ON vehicle_crm_timeline(vehicle_policy_uid);
-CREATE INDEX IF NOT EXISTS idx_crm_timeline_time ON vehicle_crm_timeline(event_time DESC);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_timeline_policy ON vehicle_crm_timeline(vehicle_policy_uid);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_timeline_time ON vehicle_crm_timeline(event_time DESC);
 
 -- 4. 客服沟通记录表
 CREATE TABLE IF NOT EXISTS vehicle_crm_interactions (
@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS vehicle_crm_interactions (
   FOREIGN KEY (vehicle_policy_uid) REFERENCES vehicle_insurance_master(vehicle_policy_uid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_crm_interactions_policy ON vehicle_crm_interactions(vehicle_policy_uid);
-CREATE INDEX IF NOT EXISTS idx_crm_interactions_time ON vehicle_crm_interactions(interaction_time DESC);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_interactions_policy ON vehicle_crm_interactions(vehicle_policy_uid);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_interactions_time ON vehicle_crm_interactions(interaction_time DESC);
 
 -- 5. 信任/风险标记表
 CREATE TABLE IF NOT EXISTS vehicle_crm_flags (
@@ -73,5 +73,5 @@ CREATE TABLE IF NOT EXISTS vehicle_crm_flags (
   FOREIGN KEY (vehicle_policy_uid) REFERENCES vehicle_insurance_master(vehicle_policy_uid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_crm_flags_policy ON vehicle_crm_flags(vehicle_policy_uid);
-CREATE INDEX IF NOT EXISTS idx_crm_flags_active ON vehicle_crm_flags(is_active);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_flags_policy ON vehicle_crm_flags(vehicle_policy_uid);
+CREATE INDEX IF NOT EXISTS IF NOT EXISTS idx_crm_flags_active ON vehicle_crm_flags(is_active);

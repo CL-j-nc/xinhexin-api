@@ -52,9 +52,9 @@ CREATE TABLE IF NOT EXISTS claim_report (
   FOREIGN KEY (policy_no) REFERENCES policy(policy_no)
 );
 
-CREATE INDEX idx_claim_report_no ON claim_report(report_no);
-CREATE INDEX idx_claim_report_policy ON claim_report(policy_no);
-CREATE INDEX idx_claim_report_status ON claim_report(status);
+CREATE INDEX IF NOT EXISTS idx_claim_report_no ON claim_report(report_no);
+CREATE INDEX IF NOT EXISTS idx_claim_report_policy ON claim_report(policy_no);
+CREATE INDEX IF NOT EXISTS idx_claim_report_status ON claim_report(status);
 
 -- ==================== 理赔表 ====================
 -- 理赔案件处理记录
@@ -93,9 +93,9 @@ CREATE TABLE IF NOT EXISTS claim (
   FOREIGN KEY (policy_no) REFERENCES policy(policy_no)
 );
 
-CREATE INDEX idx_claim_no ON claim(claim_no);
-CREATE INDEX idx_claim_report ON claim(report_no);
-CREATE INDEX idx_claim_status ON claim(status);
+CREATE INDEX IF NOT EXISTS idx_claim_no ON claim(claim_no);
+CREATE INDEX IF NOT EXISTS idx_claim_report ON claim(report_no);
+CREATE INDEX IF NOT EXISTS idx_claim_status ON claim(status);
 
 -- ==================== 理赔材料表 ====================
 -- 记录理赔所需材料及状态
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS claim_document (
   FOREIGN KEY (claim_no) REFERENCES claim(claim_no)
 );
 
-CREATE INDEX idx_claim_doc_claim ON claim_document(claim_no);
+CREATE INDEX IF NOT EXISTS idx_claim_doc_claim ON claim_document(claim_no);
 
 -- ==================== 文档中心表 ====================
 -- 系统权威性声明和制度文档
@@ -171,8 +171,8 @@ CREATE TABLE IF NOT EXISTS document_center (
   published_at DATETIME
 );
 
-CREATE INDEX idx_doc_category ON document_center(category);
-CREATE INDEX idx_doc_active ON document_center(is_active);
+CREATE INDEX IF NOT EXISTS idx_doc_category ON document_center(category);
+CREATE INDEX IF NOT EXISTS idx_doc_active ON document_center(is_active);
 
 -- ==================== 客服会话表 ====================
 -- AI客服会话记录
@@ -202,8 +202,8 @@ CREATE TABLE IF NOT EXISTS customer_service_session (
   closed_at DATETIME
 );
 
-CREATE INDEX idx_cs_session_id ON customer_service_session(session_id);
-CREATE INDEX idx_cs_session_status ON customer_service_session(status);
+CREATE INDEX IF NOT EXISTS idx_cs_session_id ON customer_service_session(session_id);
+CREATE INDEX IF NOT EXISTS idx_cs_session_status ON customer_service_session(status);
 
 -- ==================== 客服消息表 ====================
 -- 客服对话消息记录
@@ -228,7 +228,7 @@ CREATE TABLE IF NOT EXISTS customer_service_message (
   FOREIGN KEY (session_id) REFERENCES customer_service_session(session_id)
 );
 
-CREATE INDEX idx_cs_message_session ON customer_service_message(session_id);
+CREATE INDEX IF NOT EXISTS idx_cs_message_session ON customer_service_message(session_id);
 
 -- ==================== FAQ知识库表 ====================
 -- 常见问题解答知识库
@@ -263,8 +263,8 @@ CREATE TABLE IF NOT EXISTS faq_knowledge (
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_faq_category ON faq_knowledge(category);
-CREATE INDEX idx_faq_active ON faq_knowledge(is_active);
+CREATE INDEX IF NOT EXISTS idx_faq_category ON faq_knowledge(category);
+CREATE INDEX IF NOT EXISTS idx_faq_active ON faq_knowledge(is_active);
 
 -- ==================== 审计日志表 ====================
 -- 系统操作审计记录
@@ -293,8 +293,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_audit_target ON audit_log(target_type, target_id);
-CREATE INDEX idx_audit_time ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(created_at);
 
 -- ==================== 初始化权威性文档 ====================
 INSERT INTO document_center (doc_id, category, title, content, version, is_active, sort_order, published_at) VALUES
