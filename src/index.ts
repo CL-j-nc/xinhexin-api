@@ -3,6 +3,7 @@ import { handlePolicyRoutes } from "./api/policy";
 import { handleClaimReportRoutes } from "./api/claim-report";
 import { handleClaimProcessRoutes } from "./api/claim-process";
 import { handleDocumentCenterRoutes } from "./api/document-center";
+
 import { handleCustomerServiceRoutes } from "./api/customer-service";
 
 export interface Env {
@@ -412,14 +413,14 @@ function corsHeaders() {
   };
 }
 
-function jsonResponse(data: unknown, status = 200) {
+export function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
 }
 
-function now() {
+export function now() {
   return new Date().toISOString();
 }
 
@@ -890,7 +891,7 @@ async function markVerified(env: Env, table: TableKind, applicationNo: string) {
     .run();
 }
 
-function safeJsonParse(raw: string | null) {
+export function safeJsonParse(raw: string | null) {
   if (!raw) return null;
   try {
     return JSON.parse(raw);
