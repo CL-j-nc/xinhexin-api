@@ -297,7 +297,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target_type, target_id)
 CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(created_at);
 
 -- ==================== 初始化权威性文档 ====================
-INSERT INTO document_center (doc_id, category, title, content, version, is_active, sort_order, published_at) VALUES
+INSERT OR IGNORE INTO document_center (doc_id, category, title, content, version, is_active, sort_order, published_at) VALUES
 ('DOC-AUTHORITY-001', 'AUTHORITY', '平台权威性声明', 
 '# SHIE人寿服务平台权威性声明
 
@@ -396,7 +396,7 @@ INSERT INTO document_center (doc_id, category, title, content, version, is_activ
 *本提示为法定风险揭示，请认真阅读*', '1.0', 1, 5, CURRENT_TIMESTAMP);
 
 -- ==================== 初始化FAQ知识库 ====================
-INSERT INTO faq_knowledge (category, question, answer, keywords, priority) VALUES
+INSERT OR IGNORE INTO faq_knowledge (category, question, answer, keywords, priority) VALUES
 ('POLICY', '如何查询我的保单信息？', 
 '您可以通过以下方式查询保单信息：
 1. 在保单服务中心输入保单号查询
