@@ -1,5 +1,5 @@
 -- 数据迁移脚本：从现有申请数据生成 CRM 档案
--- 已适配现有表结构 (vehicle_policy_uid 为关联主键，多字段数据存储)
+-- 已适配 002_b_fix_crm_fks 后的表结构
 -- 1. 从已完成的申请中提取车辆信息，创建 CRM 档案
 INSERT INTO vehicle_crm_profile (
     vehicle_policy_uid,
@@ -16,7 +16,7 @@ SELECT lower(hex(randomblob(16))) as vehicle_policy_uid,
   applied_at as created_at,
   applied_at as updated_at
 FROM application
-WHERE status = 'ISSUED' -- 适配 application 表的状态
+WHERE status = 'ISSUED'
   AND json_extract(vehicle_data, '$.plate') IS NOT NULL
   AND json_extract(vehicle_data, '$.vin') IS NOT NULL
   AND NOT EXISTS (
@@ -27,17 +27,19 @@ WHERE status = 'ISSUED' -- 适配 application 表的状态
   );
 -- 2. 提取关系人信息（车主）
 INSERT INTO vehicle_crm_contacts (
+    contact_id,
     vehicle_policy_uid,
     role_type,
     name,
-    id_card,
+    id_no,
     phone,
     created_at
   )
-SELECT vcp.vehicle_policy_uid,
+SELECT lower(hex(randomblob(16))) as contact_id,
+  vcp.vehicle_policy_uid,
   '车主' as role_type,
   json_extract(a.owner_data, '$.name') as name,
-  json_extract(a.owner_data, '$.idCard') as id_card,
+  json_extract(a.owner_data, '$.idCard') as id_no,
   json_extract(a.owner_data, '$.mobile') as phone,
   a.applied_at as created_at
 FROM application a
