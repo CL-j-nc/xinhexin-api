@@ -18,7 +18,21 @@ const REQUEST_TTL = 90 * 24 * 3600;
 const QR_TTL = 30 * 24 * 3600;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 
+const normalizeDbText = (value: unknown, fallback: string | null = null): string | null => {
+  if (value === undefined || value === null) return fallback;
+  const text = String(value).trim();
+  return text.length > 0 ? text : fallback;
+};
+
+const normalizeDbNumber = (value: unknown): number | null => {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
 let cachedTable: TableKind | null = null;
+let draftTableReady = false;
+let proposalCoreSchemaReady = false;
 
 export default {
   async fetch(request: Request, env: Env) {
@@ -56,23 +70,54 @@ export default {
 
       // ==================== NEW UNDERWRITING FLOW ====================
 
-      // 1. Submit Proposal (Replaces /api/application/apply)
-      // POST /api/proposal/submit
-      if (pathname === "/api/proposal/submit" && request.method === "POST") {
-        const payload = await request.json() as any;
+      // ==================== NEW EVENT-DRIVEN FLOW (FINAL DELIVERY) ====================
+
+      // 1. Salesman Proposal Submission
+      // POST /api/policy.salesman
+      // - Trigger EVENT_PROPOSAL_SUBMITTED
+      // - Write application_submitted_at
+      // - Write coverage.policy_effective_date
+      if ((pathname === "/api/policy.salesman" || pathname === "/api/proposal/submit") && request.method === "POST") {
+        const payload = (await request.json().catch(() => ({}))) as any;
+        if (!payload || typeof payload !== "object") {
+          console.warn("policy.salesman validation failed: invalid payload");
+          return jsonResponse({ error: "Invalid payload" }, 400);
+        }
+
+        const vehicle = payload.vehicle;
+        if (!vehicle || typeof vehicle !== "object") {
+          console.warn("policy.salesman validation failed: missing vehicle");
+          return jsonResponse({ error: "Missing vehicle" }, 400);
+        }
+
+        const sumInsured = normalizeDbNumber(payload.sumInsured);
+        if (sumInsured === null) {
+          console.warn("policy.salesman validation failed: invalid sumInsured");
+          return jsonResponse({ error: "Invalid sumInsured" }, 400);
+        }
+
+        const policyEffectiveDate = normalizeDbText(payload.policyEffectiveDate);
+        if (!policyEffectiveDate) {
+          console.warn("policy.salesman validation failed: missing policyEffectiveDate");
+          return jsonResponse({ error: "Missing policyEffectiveDate" }, 400);
+        }
+        await ensureProposalCoreTables(env);
 
         // 1. Generate IDs
         const proposalId = `PROP-${crypto.randomUUID()}`;
         const vehicleId = `VEH-${crypto.randomUUID()}`;
+        const coverageId = `COV-${crypto.randomUUID()}`;
         const nowStr = now();
 
-        // 2. Insert into proposal
+        // 2. Insert into proposal (Event: PROPOSAL_SUBMITTED)
         await env.DB.prepare(
-          `INSERT INTO proposal (proposal_id, proposal_status, created_at, updated_at) VALUES (?, 'SUBMITTED', ?, ?)`
-        ).bind(proposalId, nowStr, nowStr).run();
+          `INSERT INTO proposal (
+             proposal_id, proposal_status, application_submitted_at, proposal_data, created_at, updated_at
+           ) VALUES (?, 'SUBMITTED', ?, ?, ?, ?)`
+        ).bind(proposalId, nowStr, JSON.stringify(payload || {}), nowStr, nowStr).run();
 
         // 3. Insert into vehicle_proposed
-        const v = payload.vehicle || {};
+        const v = vehicle as Record<string, unknown>;
         await env.DB.prepare(
           `INSERT INTO vehicle_proposed (
                vehicle_id, proposal_id, plate_number, vehicle_type, usage_nature, brand_model, 
@@ -80,29 +125,212 @@ export default {
                curb_weight, approved_load_weight, approved_passenger_count, energy_type
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
-          vehicleId, proposalId, v.plate, v.vehicleType, v.useNature, v.brand,
-          v.vin, v.engineNo, v.registerDate, v.issueDate,
-          v.curbWeight, v.approvedLoad, v.seats, payload.energyType
+          vehicleId, proposalId,
+          normalizeDbText(v.plate),
+          normalizeDbText(v.vehicleType),
+          normalizeDbText(v.useNature),
+          normalizeDbText(v.brand),
+          normalizeDbText(v.vin),
+          normalizeDbText(v.engineNo),
+          normalizeDbText(v.registerDate),
+          normalizeDbText(v.issueDate),
+          normalizeDbNumber(v.curbWeight),
+          normalizeDbNumber(v.approvedLoad),
+          normalizeDbNumber(v.seats),
+          normalizeDbText(payload.energyType)
+        ).run();
+
+        // 4. Insert into coverage_proposed
+        // Coverage is proposed by Salesman/Client
+        await env.DB.prepare(
+          `INSERT INTO coverage_proposed (
+                coverage_id, proposal_id, sum_insured, policy_effective_date
+            ) VALUES (?, ?, ?, ?)`
+        ).bind(
+          coverageId, proposalId, sumInsured, policyEffectiveDate // Client selected
         ).run();
 
         // Return success with IDs
-        return jsonResponse({ success: true, proposalId });
+        return jsonResponse({ success: true, proposalId, event: "EVENT_PROPOSAL_SUBMITTED" });
       }
 
-      // 2. Get Pending Proposals for Underwriter
+      // Salesman Draft Save (Cloud D1 only, no browser local persistence required)
+      // POST /api/proposal/draft/upsert
+      if (pathname === "/api/proposal/draft/upsert" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as {
+          draftId?: string;
+          data?: unknown;
+        };
+        const draftId = body.draftId?.trim();
+
+        if (!draftId) {
+          return jsonResponse({ error: "Missing draftId" }, 400);
+        }
+
+        await ensureProposalDraftTable(env);
+        const nowStr = now();
+        const payload = JSON.stringify(body.data || {});
+
+        await env.DB.prepare(
+          `INSERT INTO proposal_form_draft (draft_id, payload, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(draft_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
+        ).bind(draftId, payload, nowStr, nowStr).run();
+
+        return jsonResponse({ success: true, draftId, updatedAt: nowStr });
+      }
+
+      // Salesman Draft Query
+      // GET /api/proposal/draft?id=xxx
+      if (pathname === "/api/proposal/draft" && request.method === "GET") {
+        const draftId = url.searchParams.get("id")?.trim();
+        if (!draftId) {
+          return jsonResponse({ error: "Missing id" }, 400);
+        }
+
+        await ensureProposalDraftTable(env);
+        const row = await env.DB.prepare(
+          `SELECT payload, updated_at FROM proposal_form_draft WHERE draft_id = ?`
+        ).bind(draftId).first<{ payload: string; updated_at: string }>();
+
+        if (!row) {
+          return jsonResponse({ success: true, data: null });
+        }
+
+        return jsonResponse({
+          success: true,
+          data: safeJsonParse(row.payload) || null,
+          updatedAt: row.updated_at,
+        });
+      }
+
+      // Salesman Latest Draft Query
+      // GET /api/proposal/draft/latest
+      if (pathname === "/api/proposal/draft/latest" && request.method === "GET") {
+        await ensureProposalDraftTable(env);
+        const row = await env.DB.prepare(
+          `SELECT draft_id, updated_at FROM proposal_form_draft ORDER BY updated_at DESC LIMIT 1`
+        ).first<{ draft_id: string; updated_at: string }>();
+
+        if (!row) {
+          return jsonResponse({ success: true, data: null });
+        }
+
+        return jsonResponse({
+          success: true,
+          data: {
+            draftId: row.draft_id,
+            updatedAt: row.updated_at,
+          },
+        });
+      }
+
+      // Salesman Proposal Detail
+      // GET /api/proposal/detail?id=PROP-xxx
+      if (pathname === "/api/proposal/detail" && request.method === "GET") {
+        const proposalId = url.searchParams.get("id")?.trim();
+        if (!proposalId) return jsonResponse({ error: "Missing id" }, 400);
+
+        await ensureProposalCoreTables(env);
+        const proposal = await env.DB.prepare(
+          `SELECT proposal_id, proposal_status, proposal_data, application_submitted_at, created_at
+           FROM proposal
+           WHERE proposal_id = ?`
+        ).bind(proposalId).first<any>();
+
+        if (!proposal) return jsonResponse({ error: "Not found" }, 404);
+
+        let data = safeJsonParse(proposal.proposal_data) as Record<string, unknown> | null;
+        if (!data || typeof data !== "object") data = {};
+
+        // 兜底：历史脏数据可能没有 proposal_data，尽可能从 vehicle_proposed 还原基础字段
+        if (!data.vehicle) {
+          const vehicle = await env.DB.prepare(
+            `SELECT plate_number, vehicle_type, usage_nature, brand_model, vin_chassis_number,
+                    engine_number, registration_date, license_issue_date, curb_weight,
+                    approved_load_weight, approved_passenger_count, energy_type
+             FROM vehicle_proposed
+             WHERE proposal_id = ?
+             LIMIT 1`
+          ).bind(proposalId).first<any>();
+          if (vehicle) {
+            data.vehicle = {
+              plate: vehicle.plate_number || "",
+              vehicleType: vehicle.vehicle_type || "",
+              useNature: vehicle.usage_nature || "",
+              brand: vehicle.brand_model || "",
+              vin: vehicle.vin_chassis_number || "",
+              engineNo: vehicle.engine_number || "",
+              registerDate: vehicle.registration_date || "",
+              issueDate: vehicle.license_issue_date || "",
+              curbWeight: vehicle.curb_weight || "",
+              approvedLoad: vehicle.approved_load_weight || "",
+              seats: vehicle.approved_passenger_count || "",
+              energyType: vehicle.energy_type || "FUEL",
+            };
+          }
+        }
+
+        return jsonResponse({
+          success: true,
+          id: proposal.proposal_id,
+          status: proposal.proposal_status,
+          createdAt: proposal.application_submitted_at || proposal.created_at || now(),
+          data,
+        });
+      }
+
+      // Salesman Legacy Detail Compatibility
+      // GET /api/application/detail?id=xxx
+      if (pathname === "/api/application/detail" && request.method === "GET") {
+        const id = url.searchParams.get("id")?.trim();
+        if (!id) return jsonResponse({ error: "Missing id" }, 400);
+
+        if (id.startsWith("PROP-")) {
+          await ensureProposalCoreTables(env);
+          const proposal = await env.DB.prepare(
+            `SELECT proposal_status, proposal_data FROM proposal WHERE proposal_id = ?`
+          ).bind(id).first<any>();
+          if (!proposal) return jsonResponse({ error: "Not found" }, 404);
+          return jsonResponse({
+            id,
+            status: proposal.proposal_status,
+            data: safeJsonParse(proposal.proposal_data) || null,
+          });
+        }
+
+        const table = await resolveTable(env);
+        const detail = await getApplicationDetail(env, table, id);
+        if (!detail) return jsonResponse({ error: "Not found" }, 404);
+        return jsonResponse({
+          id,
+          status: (detail as any).status || "APPLIED",
+          data: (detail as any).data || null,
+        });
+      }
+
+      // Unified history for salesman import panel
+      // GET /api/application/history
+      if (pathname === "/api/application/history" && request.method === "GET") {
+        const history = await listUnifiedHistory(env);
+        return jsonResponse(history);
+      }
+
+      // 2. Get Pending Proposals (For Underwriter UI)
       // GET /api/underwriting/pending
       if (pathname === "/api/underwriting/pending" && request.method === "GET") {
+        // Simulates receiving EVENT_UNDERWRITING_RECEIVED when viewing list
         const { results } = await env.DB.prepare(
-          `SELECT p.proposal_id, p.proposal_status, p.created_at, v.vehicle_type, v.plate_number, v.brand_model 
+          `SELECT p.proposal_id, p.proposal_status, p.application_submitted_at, v.vehicle_type, v.plate_number, v.brand_model 
            FROM proposal p
            LEFT JOIN vehicle_proposed v ON p.proposal_id = v.proposal_id
            WHERE p.proposal_status = 'SUBMITTED'
-           ORDER BY p.created_at DESC`
+           ORDER BY p.application_submitted_at DESC`
         ).all();
         return jsonResponse(results || []);
       }
 
-      // 3. Get Proposal Detail for Underwriter
+      // 3. Get Proposal Detail (For Underwriter UI)
       // GET /api/underwriting/detail
       if (pathname === "/api/underwriting/detail" && request.method === "GET") {
         const id = url.searchParams.get("id");
@@ -112,84 +340,102 @@ export default {
         if (!proposal) return jsonResponse({ error: "Not found" }, 404);
 
         const vehicle = await env.DB.prepare("SELECT * FROM vehicle_proposed WHERE proposal_id = ?").bind(id).first<any>();
+        const coverage = await env.DB.prepare("SELECT * FROM coverage_proposed WHERE proposal_id = ?").bind(id).first<any>();
 
-        return jsonResponse({ proposal, vehicle });
+        return jsonResponse({ proposal, vehicle, coverage });
       }
 
-      // 4. Submit Underwriting Decision
-      // POST /api/underwriting/decide
-      if (pathname === "/api/underwriting/decide" && request.method === "POST") {
+      // 4. Underwriting Decision (Manual)
+      // POST /api/underwriting/decision
+      // - Allow modification of ALL time fields
+      // - Write underwriting_manual_decision
+      // - Trigger EVENT_UNDERWRITING_CONFIRMED
+      if (pathname === "/api/underwriting/decision" && request.method === "POST") {
         const payload = await request.json() as any;
         const { proposalId, decision, vehicleConfirmed, underwriterName } = payload;
-        // decision: { riskLevel, riskReason, acceptance, finalPremium, ... }
 
         if (!proposalId || !decision) return jsonResponse({ error: "Missing data" }, 400);
 
-        // A. Insert Manual Decision
         const decisionId = `DEC-${crypto.randomUUID()}`;
+        const nowStr = now();
+
+        // A. Insert Manual Decision Record
         await env.DB.prepare(`
           INSERT INTO underwriting_manual_decision (
             decision_id, proposal_id, 
+            final_premium, policy_effective_date, policy_expiry_date,
+            underwriter_name, underwriter_id, underwriting_confirmed_at,
             underwriting_risk_level, underwriting_risk_reason, underwriting_risk_acceptance,
             usage_authenticity_judgment, usage_verification_basis,
             loss_history_estimation, loss_history_basis, ncd_assumption,
-            final_premium, premium_adjustment_reason,
-            coverage_adjustment_flag, coverage_adjustment_detail,
-            special_exception_flag, special_exception_description,
-            underwriter_name, underwriter_id, underwriting_confirmed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            premium_adjustment_reason, coverage_adjustment_flag, coverage_adjustment_detail,
+            special_exception_flag, special_exception_description
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           decisionId, proposalId,
+          decision.finalPremium, decision.policyEffectiveDate, decision.policyExpiryDate, // Underwriter Modified Times
+          underwriterName || "System", "U001", nowStr,
           decision.riskLevel, decision.riskReason, decision.acceptance,
           decision.usageJudgment || "N/A", decision.usageBasis || "N/A",
           decision.lossHistory || "N/A", decision.lossBasis || "N/A", decision.ncd || "N/A",
-          decision.finalPremium, decision.premiumReason || "N/A",
+          decision.premiumReason || "N/A",
           decision.coverageFlag || 0, decision.coverageDetail || "",
-          decision.exceptionFlag || 0, decision.exceptionDesc || "",
-          underwriterName || "System", "U001", now()
+          decision.exceptionFlag || 0, decision.exceptionDesc || ""
         ).run();
 
-        // B. Insert Underwritten Vehicle (Confirmed values)
-        if (vehicleConfirmed) {
-          const vId = `V-UND-${crypto.randomUUID()}`;
-          await env.DB.prepare(`
-             INSERT INTO vehicle_underwritten (
-               underwritten_vehicle_id, proposal_id,
-               plate_number, vehicle_type, usage_nature, brand_model,
-               vin_chassis_number, engine_number,
-               curb_weight, approved_load_weight, approved_passenger_count, energy_type
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           `).bind(
-            vId, proposalId,
-            vehicleConfirmed.plate, vehicleConfirmed.vehicleType, vehicleConfirmed.useNature, vehicleConfirmed.brand,
-            vehicleConfirmed.vin, vehicleConfirmed.engineNo,
-            vehicleConfirmed.curbWeight, vehicleConfirmed.approvedLoad, vehicleConfirmed.seats, vehicleConfirmed.energyType
-          ).run();
+        // B. Update Proposal Status & Time
+        await env.DB.prepare(
+          `UPDATE proposal 
+             SET proposal_status = 'UNDERWRITING_CONFIRMED', underwriting_confirmed_at = ?, updated_at = ? 
+             WHERE proposal_id = ?`
+        ).bind(nowStr, nowStr, proposalId).run();
+
+        // NOTE: We do NOT create policy here. Policy creation is a separate Event Reaction.
+        // Return success triggering the next event flow on the client or via internal hook (here we just return success)
+
+        return jsonResponse({
+          success: true,
+          decisionId,
+          event: "EVENT_UNDERWRITING_CONFIRMED"
+        });
+      }
+
+      // 5. Policy Issuance (Triggered by EVENT_UNDERWRITING_CONFIRMED)
+      // POST /api/policy.issue
+      // - Only triggerable if status is UNDERWRITING_CONFIRMED
+      // - Writes policy_issue_date
+      // - Generates Policy
+      if (pathname === "/api/policy.issue" && request.method === "POST") {
+        const payload = await request.json() as any;
+        const { proposalId } = payload;
+
+        // Verify State
+        const proposal = await env.DB.prepare("SELECT * FROM proposal WHERE proposal_id = ?").bind(proposalId).first<any>();
+        if (!proposal || proposal.proposal_status !== 'UNDERWRITING_CONFIRMED') {
+          return jsonResponse({ error: "Invalid state for issuance" }, 400);
         }
 
-        // C. Update Proposal Status
-        const newStatus = decision.acceptance === "ACCEPT" ? "APPROVED" : "REJECTED";
-        await env.DB.prepare("UPDATE proposal SET proposal_status = ?, updated_at = ? WHERE proposal_id = ?")
-          .bind(newStatus, now(), proposalId).run();
+        // Fetch Decision for Final Terms
+        const decision = await env.DB.prepare("SELECT * FROM underwriting_manual_decision WHERE proposal_id = ?").bind(proposalId).first<any>();
+        if (!decision) return jsonResponse({ error: "Missing underwriting decision" }, 500);
 
-        // D. (Optional) Create Policy if Approved
-        // Per instruction: "Policy table (Only recognizing underwriting result)"
-        if (newStatus === "APPROVED") {
-          const policyId = `POL-${crypto.randomUUID()}`;
-          await env.DB.prepare(`
-             INSERT INTO policy (
-               policy_id, proposal_id, policy_status, 
-               policy_issue_date, policy_effective_date, policy_expiry_date,
-               final_premium, underwriter_name
-             ) VALUES (?, ?, 'EFFECTIVE', ?, ?, ?, ?, ?)
-           `).bind(
-            policyId, proposalId,
-            now(), now(), "2027-01-01T00:00:00Z", // Simplified expiry
-            decision.finalPremium, underwriterName || "System"
-          ).run();
-        }
+        const policyId = `POL-${crypto.randomUUID()}`;
+        const nowStr = now();
 
-        return jsonResponse({ success: true, decisionId });
+        await env.DB.prepare(`
+            INSERT INTO policy (
+              policy_id, proposal_id, policy_status, 
+              policy_issue_date, policy_effective_date, policy_expiry_date,
+              final_premium, underwriter_name
+            ) VALUES (?, ?, 'EFFECTIVE', ?, ?, ?, ?, ?)
+          `).bind(
+          policyId, proposalId,
+          nowStr, decision.policy_effective_date, decision.policy_expiry_date,
+          decision.final_premium, decision.underwriter_name
+        ).run();
+
+        // Emit EVENT_POLICY_ISSUED (conceptually)
+        return jsonResponse({ success: true, policyId, event: "EVENT_POLICY_ISSUED" });
       }
 
       // 2. Get Proposal Status (For UI polling)
@@ -197,6 +443,7 @@ export default {
       if (pathname === "/api/proposal/status" && request.method === "GET") {
         const id = url.searchParams.get("id");
         if (!id) return jsonResponse({ error: "Missing id" }, 400);
+        await ensureProposalCoreTables(env);
 
         const result = await env.DB.prepare(
           `SELECT * FROM proposal WHERE proposal_id = ?`
@@ -240,6 +487,18 @@ export default {
         });
 
         return jsonResponse({ success: true, requestId });
+      }
+
+      if (pathname === "/api/application/search" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as {
+          insuredName?: string;
+          idCard?: string;
+          mobile?: string;
+          plate?: string;
+          engineNo?: string;
+        };
+        const results = await searchApplicationsByFields(env, body);
+        return jsonResponse(results);
       }
 
       if (pathname === "/api/application/search" && request.method === "GET") {
@@ -889,6 +1148,223 @@ async function markVerified(env: Env, table: TableKind, applicationNo: string) {
   )
     .bind("verified", applicationNo)
     .run();
+}
+
+async function ensureProposalDraftTable(env: Env) {
+  if (draftTableReady) return;
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS proposal_form_draft (
+      draft_id TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`
+  ).run();
+
+  draftTableReady = true;
+}
+
+async function ensureProposalCoreTables(env: Env) {
+  if (proposalCoreSchemaReady) return;
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS proposal (
+      proposal_id TEXT PRIMARY KEY,
+      proposal_status TEXT NOT NULL,
+      application_submitted_at TEXT,
+      proposal_data TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`
+  ).run();
+
+  await safeAlterTableAddColumn(env, "proposal", "application_submitted_at TEXT");
+  await safeAlterTableAddColumn(env, "proposal", "proposal_data TEXT");
+  await safeAlterTableAddColumn(env, "proposal", "created_at TEXT");
+  await safeAlterTableAddColumn(env, "proposal", "updated_at TEXT");
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS vehicle_proposed (
+      vehicle_id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL,
+      plate_number TEXT,
+      vehicle_type TEXT,
+      usage_nature TEXT,
+      brand_model TEXT,
+      vin_chassis_number TEXT,
+      engine_number TEXT,
+      registration_date TEXT,
+      license_issue_date TEXT,
+      curb_weight REAL,
+      approved_load_weight REAL,
+      approved_passenger_count INTEGER,
+      energy_type TEXT
+    )`
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS coverage_proposed (
+      coverage_id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL,
+      sum_insured REAL,
+      policy_effective_date TEXT
+    )`
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_proposal_created_at ON proposal(created_at)`
+  ).run();
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_vehicle_proposed_proposal_id ON vehicle_proposed(proposal_id)`
+  ).run();
+
+  proposalCoreSchemaReady = true;
+}
+
+async function safeAlterTableAddColumn(env: Env, table: string, definition: string) {
+  try {
+    await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${definition}`).run();
+  } catch {
+    // ignore duplicate-column or schema-compat errors
+  }
+}
+
+interface UnifiedRecord {
+  applicationNo: string;
+  status: string;
+  createdAt: string;
+  data: any;
+}
+
+interface SearchCriteria {
+  insuredName?: string;
+  idCard?: string;
+  mobile?: string;
+  plate?: string;
+  engineNo?: string;
+}
+
+async function loadProposalRecords(env: Env): Promise<UnifiedRecord[]> {
+  await ensureProposalCoreTables(env);
+  const { results } = await env.DB.prepare(
+    `SELECT proposal_id, proposal_status, application_submitted_at, created_at, proposal_data
+     FROM proposal
+     ORDER BY COALESCE(application_submitted_at, created_at) DESC
+     LIMIT 200`
+  ).all<any>();
+
+  return (results || []).map((row: any) => ({
+    applicationNo: row.proposal_id,
+    status: row.proposal_status || "SUBMITTED",
+    createdAt: row.application_submitted_at || row.created_at || now(),
+    data: safeJsonParse(row.proposal_data) || {},
+  }));
+}
+
+async function loadLegacyRecords(env: Env): Promise<UnifiedRecord[]> {
+  const table = await resolveTable(env);
+
+  if (table === "applications") {
+    const { results } = await env.DB.prepare(
+      `SELECT applicationNo, status, applyAt, dataJson
+       FROM applications
+       ORDER BY applyAt DESC
+       LIMIT 200`
+    ).all<any>();
+
+    return (results || []).map((row: any) => ({
+      applicationNo: row.applicationNo,
+      status: row.status || "APPLIED",
+      createdAt: row.applyAt || now(),
+      data: safeJsonParse(row.dataJson) || {},
+    }));
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT application_no, status, applied_at, data
+     FROM application
+     ORDER BY applied_at DESC
+     LIMIT 200`
+  ).all<any>();
+
+  return (results || []).map((row: any) => ({
+    applicationNo: row.application_no,
+    status: row.status || "APPLIED",
+    createdAt: row.applied_at || now(),
+    data: safeJsonParse(row.data) || {},
+  }));
+}
+
+async function listUnifiedHistory(env: Env) {
+  const [proposalRecords, legacyRecords] = await Promise.all([
+    loadProposalRecords(env),
+    loadLegacyRecords(env),
+  ]);
+
+  return [...proposalRecords, ...legacyRecords]
+    .sort((a, b) => Date.parse(b.createdAt || "") - Date.parse(a.createdAt || ""))
+    .slice(0, 50)
+    .map((item) => ({
+      id: item.applicationNo,
+      timestamp: Date.parse(item.createdAt || "") || Date.now(),
+      status: item.status,
+      energyType: item.data?.energyType || item.data?.vehicle?.energyType || "FUEL",
+      plate: item.data?.vehicle?.plate || "",
+      brand: item.data?.vehicle?.brand || "",
+      vehicle_type: item.data?.vehicle?.vehicleType || "",
+    }));
+}
+
+async function searchApplicationsByFields(env: Env, criteria: SearchCriteria) {
+  const [proposalRecords, legacyRecords] = await Promise.all([
+    loadProposalRecords(env),
+    loadLegacyRecords(env),
+  ]);
+
+  const filtered = [...proposalRecords, ...legacyRecords]
+    .filter((record) => matchesSearchCriteria(record.data, criteria))
+    .sort((a, b) => Date.parse(b.createdAt || "") - Date.parse(a.createdAt || ""))
+    .slice(0, 50);
+
+  return filtered.map((item) => ({
+    applicationNo: item.applicationNo,
+    status: item.status,
+    createdAt: item.createdAt,
+    vehicle: item.data?.vehicle || {},
+    owner: item.data?.owner || {},
+  }));
+}
+
+function matchesSearchCriteria(data: any, criteria: SearchCriteria) {
+  const insuredName = normalizeText(criteria.insuredName);
+  const idCard = normalizeText(criteria.idCard);
+  const mobile = normalizeText(criteria.mobile);
+  const plate = normalizeText(criteria.plate);
+  const engineNo = normalizeText(criteria.engineNo);
+
+  const vehicle = data?.vehicle || {};
+  const owner = data?.owner || {};
+  const proposer = data?.proposer || {};
+  const insured = data?.insured || {};
+
+  const people = [owner, proposer, insured];
+  const personIdCards = people.map((person) => normalizeText(person?.idCard)).filter(Boolean);
+  const personMobiles = people.map((person) => normalizeText(person?.mobile)).filter(Boolean);
+  const personNames = people.map((person) => normalizeText(person?.name)).filter(Boolean);
+
+  const insuredMatched = !insuredName || personNames.some((name) => name.includes(insuredName));
+  const idCardMatched = !idCard || personIdCards.some((value) => value.includes(idCard));
+  const mobileMatched = !mobile || personMobiles.some((value) => value.includes(mobile));
+  const plateMatched = !plate || normalizeText(vehicle?.plate).includes(plate);
+  const engineMatched = !engineNo || normalizeText(vehicle?.engineNo).includes(engineNo);
+
+  return insuredMatched && idCardMatched && mobileMatched && plateMatched && engineMatched;
+}
+
+function normalizeText(value: unknown) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase();
 }
 
 export function safeJsonParse(raw: string | null) {

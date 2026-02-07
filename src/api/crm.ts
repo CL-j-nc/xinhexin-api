@@ -8,14 +8,22 @@ interface Env {
 
 // flag_type 枚举值
 const VALID_FLAG_TYPES = ['VIP客户', '高风险', '欺诈嫌疑', '优质客户', '续保重点', '投诉敏感'];
+let crmSchemaReady = false;
 
 export async function handleCRMRoutes(request: Request, env: Env, pathname: string) {
     // 健康检查
-    if (pathname === "/api/health" && request.method === "HEAD") {
-        return new Response(null, {
-            status: 200,
-            headers: { ...corsHeaders() }
-        });
+    if (pathname === "/api/health" && (request.method === "HEAD" || request.method === "GET")) {
+        if (request.method === "HEAD") {
+            return new Response(null, {
+                status: 200,
+                headers: { ...corsHeaders() }
+            });
+        }
+        return jsonResponse({ ok: true, service: "xinhexin-api", ts: new Date().toISOString() });
+    }
+
+    if (pathname.startsWith("/api/crm/")) {
+        await ensureCrmSchema(env);
     }
 
     // ========== 规范接口 ==========
@@ -153,7 +161,198 @@ export async function handleCRMRoutes(request: Request, env: Env, pathname: stri
         return jsonResponse(vehicles);
     }
 
+    // POST /api/crm/vehicles/bulk - 批量导入车辆（及车主）
+    if (pathname === "/api/crm/vehicles/bulk" && request.method === "POST") {
+        const body = await request.json() as { vehicles: any[] };
+        const vehicles = body.vehicles || [];
+        const results: any[] = [];
+        const errors: string[] = [];
+
+        // 验证输入
+        if (!Array.isArray(vehicles) || vehicles.length === 0) {
+            return jsonResponse({ error: "No vehicles provided" }, 400);
+        }
+
+        for (const v of vehicles) {
+            try {
+                // 1. 生成或获取 ID
+                const vehiclePolicyUid = `VEH-CRM-${crypto.randomUUID()}`;
+                const nowStr = new Date().toISOString();
+
+                // 2. 写入主表 vehicle_insurance_master (如果已存在则更新，这里简化为 INSERT OR REPLACE 或先查后写，为了性能我们用 INSERT OR IGNORE + UPDATE)
+                // 由于 SQLite 限制，这里简单处理：先尝使用 plate 查询，如果存在取出 ID，否则新建
+                // 注意：真实场景应该更严谨判断 plate + vin
+
+                let targetUid = vehiclePolicyUid;
+                const existing = await env.DB.prepare(
+                    `SELECT vehicle_policy_uid FROM vehicle_insurance_master WHERE vehicle_plate_no = ?`
+                ).bind(v.plate).first<{ vehicle_policy_uid: string }>();
+
+                if (existing) {
+                    targetUid = existing.vehicle_policy_uid;
+                    // 更新主表信息
+                    await env.DB.prepare(
+                        `UPDATE vehicle_insurance_master 
+                         SET vehicle_vin = ?, vehicle_model = ?, updated_at = ?
+                         WHERE vehicle_policy_uid = ?`
+                    ).bind(v.vin, v.brand, nowStr, targetUid).run();
+                } else {
+                    // 插入主表
+                    await env.DB.prepare(
+                        `INSERT INTO vehicle_insurance_master 
+                         (vehicle_policy_uid, vehicle_plate_no, vehicle_vin, vehicle_model, created_at, updated_at, underwriting_status)
+                         VALUES (?, ?, ?, ?, ?, ?, 'IMPORTED')`
+                    ).bind(targetUid, v.plate, v.vin, v.brand, nowStr, nowStr).run();
+                }
+
+                // 3. 写入 CRM Profile
+                await env.DB.prepare(
+                    `INSERT INTO vehicle_crm_profile (vehicle_policy_uid, current_status, created_at)
+                     VALUES (?, 'ACTIVE', ?)
+                     ON CONFLICT(vehicle_policy_uid) DO UPDATE SET current_status = 'ACTIVE'`
+                ).bind(targetUid, nowStr).run();
+
+                // 4. 处理车主信息 (如果有)
+                if (v.policyInfo && (v.policyInfo.ownerName || v.policyInfo.ownerPhone)) {
+                    const contactId = `CONT-${crypto.randomUUID()}`;
+                    // 简单起见，先删除旧的车主信息再插入，避免重复
+                    await env.DB.prepare(
+                        `DELETE FROM vehicle_crm_contacts 
+                         WHERE vehicle_policy_uid = ? AND role_type = 'CarOwner'`
+                    ).bind(targetUid).run();
+
+                    await env.DB.prepare(
+                        `INSERT INTO vehicle_crm_contacts
+                         (contact_id, vehicle_policy_uid, role_type, name, phone, id_no, created_at)
+                         VALUES (?, ?, 'CarOwner', ?, ?, ?, ?)`
+                    ).bind(
+                        contactId,
+                        targetUid,
+                        v.policyInfo.ownerName || "未知车主",
+                        v.policyInfo.ownerPhone || "",
+                        v.policyInfo.ownerIdCard || "",
+                        nowStr
+                    ).run();
+                }
+
+                results.push({ plate: v.plate, success: true, id: targetUid });
+
+            } catch (e: any) {
+                errors.push(`Plate ${v.plate}: ${e.message}`);
+                results.push({ plate: v.plate, success: false, error: e.message });
+            }
+        }
+
+        return jsonResponse({
+            success: true,
+            imported: results.filter(r => r.success).length,
+            details: results,
+            errors: errors
+        });
+    }
+
     return null;
+}
+
+async function ensureCrmSchema(env: Env) {
+    if (crmSchemaReady) return;
+
+    await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS vehicle_insurance_master (
+            vehicle_policy_uid TEXT PRIMARY KEY,
+            vehicle_plate_no TEXT NOT NULL,
+            vehicle_vin TEXT NOT NULL,
+            vehicle_model TEXT,
+            policyholder_name TEXT,
+            insured_name TEXT,
+            underwriting_status TEXT DEFAULT 'IMPORTED',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )`
+    ).run();
+
+    await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS vehicle_crm_profile (
+            vehicle_policy_uid TEXT PRIMARY KEY,
+            current_status TEXT DEFAULT 'ACTIVE',
+            last_contact_time TEXT,
+            remark TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run();
+
+    await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS vehicle_crm_contacts (
+            contact_id TEXT PRIMARY KEY,
+            vehicle_policy_uid TEXT NOT NULL,
+            role_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            id_type TEXT,
+            id_no TEXT,
+            phone TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run();
+
+    await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS vehicle_crm_timeline (
+            timeline_id TEXT PRIMARY KEY,
+            vehicle_policy_uid TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_desc TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run();
+
+    await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS vehicle_crm_interactions (
+            interaction_id TEXT PRIMARY KEY,
+            vehicle_policy_uid TEXT NOT NULL,
+            contact_method TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            result TEXT,
+            follow_up_status TEXT DEFAULT '待跟进',
+            interaction_time TEXT NOT NULL,
+            operator_name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run();
+
+    await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS vehicle_crm_flags (
+            flag_id TEXT PRIMARY KEY,
+            vehicle_policy_uid TEXT NOT NULL,
+            flag_type TEXT NOT NULL,
+            flag_note TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_by TEXT NOT NULL,
+            revoked_at TEXT,
+            revoked_by TEXT
+        )`
+    ).run();
+
+    await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_vehicle_insurance_plate ON vehicle_insurance_master(vehicle_plate_no)`
+    ).run();
+    await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_vehicle_insurance_vin ON vehicle_insurance_master(vehicle_vin)`
+    ).run();
+    await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_crm_contacts_policy ON vehicle_crm_contacts(vehicle_policy_uid)`
+    ).run();
+    await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_crm_timeline_policy ON vehicle_crm_timeline(vehicle_policy_uid)`
+    ).run();
+    await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_crm_interactions_policy ON vehicle_crm_interactions(vehicle_policy_uid)`
+    ).run();
+    await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_crm_flags_policy ON vehicle_crm_flags(vehicle_policy_uid)`
+    ).run();
+
+    crmSchemaReady = true;
 }
 
 // ========== 验证函数 ==========
