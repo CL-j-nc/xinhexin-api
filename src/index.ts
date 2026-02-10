@@ -404,9 +404,26 @@ export default {
           if (!proposal) return jsonResponse({ error: "Not found" }, 404);
 
           const vehicle = await env.DB.prepare("SELECT * FROM vehicle_proposed WHERE proposal_id = ?").bind(id).first<any>();
-          const coverage = await env.DB.prepare("SELECT * FROM coverage_proposed WHERE proposal_id = ?").bind(id).first<any>();
+          const { results: coverage } = await env.DB.prepare("SELECT * FROM coverage_proposed WHERE proposal_id = ?").bind(id).all<any>();
 
-          return jsonResponse({ proposal, vehicle, coverage });
+          // Parse proposal_data to extract person info (owner, proposer, insured)
+          let proposalData: any = null;
+          try {
+            proposalData = proposal.proposal_data ? JSON.parse(proposal.proposal_data) : null;
+          } catch { proposalData = null; }
+
+          // Also check for existing decision (payment link etc)
+          const existingDecision = await env.DB.prepare(
+            "SELECT payment_qr_code FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
+          ).bind(id).first<any>();
+
+          return jsonResponse({
+            proposal,
+            vehicle,
+            coverage,
+            proposalData,
+            paymentLink: existingDecision?.payment_qr_code || null
+          });
         }
 
         // 4. Underwriting Decision (Manual)
@@ -416,12 +433,32 @@ export default {
         // - Trigger EVENT_UNDERWRITING_CONFIRMED
         if (pathname === "/api/underwriting/decision" && request.method === "POST") {
           const payload = await request.json() as any;
-          const { proposalId, decision, vehicleConfirmed, underwriterName } = payload;
+          const { proposalId, decision, vehicleConfirmed, underwriterName, paymentQrCode, coverages, paymentLink, updatedPersons } = payload;
 
           if (!proposalId || !decision) return jsonResponse({ error: "Missing data" }, 400);
 
           const decisionId = `DEC-${crypto.randomUUID()}`;
           const nowStr = now();
+
+          // A0. Update Coverages (If provided) -> The Underwriter Overwrite
+          if (Array.isArray(coverages) && coverages.length > 0) {
+            // 1. Delete existing
+            await env.DB.prepare("DELETE FROM coverage_proposed WHERE proposal_id = ?").bind(proposalId).run();
+            // 2. Insert new
+            const stmt = env.DB.prepare(`
+                INSERT INTO coverage_proposed (coverage_id, proposal_id, coverage_code, coverage_name, sum_insured, policy_effective_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+             `);
+            const batch = coverages.map((c: any) => stmt.bind(
+              c.coverage_id || `COV-${crypto.randomUUID()}`,
+              proposalId,
+              c.coverage_code || "MISC",
+              c.coverage_name || "Custom Coverage",
+              c.sum_insured || 0,
+              decision.policyEffectiveDate // Align with policy effective date
+            ));
+            await env.DB.batch(batch);
+          }
 
           // A. Insert Manual Decision Record
           await env.DB.prepare(`
@@ -433,8 +470,9 @@ export default {
             usage_authenticity_judgment, usage_verification_basis,
             loss_history_estimation, loss_history_basis, ncd_assumption,
             premium_adjustment_reason, coverage_adjustment_flag, coverage_adjustment_detail,
-            special_exception_flag, special_exception_description
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            special_exception_flag, special_exception_description,
+            payment_qr_code, adjusted_coverage_data
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
             decisionId, proposalId,
             decision.finalPremium, decision.policyEffectiveDate, decision.policyExpiryDate, // Underwriter Modified Times
@@ -444,8 +482,34 @@ export default {
             decision.lossHistory || "N/A", decision.lossBasis || "N/A", decision.ncd || "N/A",
             decision.premiumReason || "N/A",
             decision.coverageFlag || 0, decision.coverageDetail || "",
-            decision.exceptionFlag || 0, decision.exceptionDesc || ""
+            decision.exceptionFlag || 0, decision.exceptionDesc || "",
+            paymentLink || paymentQrCode || null, JSON.stringify(coverages || [])
           ).run();
+
+          // A1. Update proposal_data with person edits if provided
+          if (updatedPersons && typeof updatedPersons === 'object') {
+            const existingProposal = await env.DB.prepare("SELECT proposal_data FROM proposal WHERE proposal_id = ?").bind(proposalId).first<any>();
+            let existingData: any = {};
+            try { existingData = existingProposal?.proposal_data ? JSON.parse(existingProposal.proposal_data) : {}; } catch { existingData = {}; }
+            if (updatedPersons.owner) existingData.owner = updatedPersons.owner;
+            if (updatedPersons.proposer) existingData.proposer = updatedPersons.proposer;
+            if (updatedPersons.insured) existingData.insured = updatedPersons.insured;
+            if (updatedPersons.vehicle) existingData.vehicle = updatedPersons.vehicle;
+            await env.DB.prepare("UPDATE proposal SET proposal_data = ? WHERE proposal_id = ?").bind(JSON.stringify(existingData), proposalId).run();
+          }
+
+          // A2. Update vehicle_proposed if vehicle data provided
+          if (vehicleConfirmed && typeof vehicleConfirmed === 'object') {
+            const vc = vehicleConfirmed as Record<string, unknown>;
+            await env.DB.prepare(
+              `UPDATE vehicle_proposed SET plate_number=?, vehicle_type=?, usage_nature=?, brand_model=?, vin_chassis_number=?, engine_number=?, registration_date=?, license_issue_date=?, curb_weight=?, approved_load_weight=?, approved_passenger_count=?, energy_type=? WHERE proposal_id=?`
+            ).bind(
+              normalizeDbText(vc.plate_number), normalizeDbText(vc.vehicle_type), normalizeDbText(vc.usage_nature), normalizeDbText(vc.brand_model),
+              normalizeDbText(vc.vin_chassis_number), normalizeDbText(vc.engine_number), normalizeDbText(vc.registration_date), normalizeDbText(vc.license_issue_date),
+              normalizeDbNumber(vc.curb_weight), normalizeDbNumber(vc.approved_load_weight), normalizeDbNumber(vc.approved_passenger_count), normalizeDbText(vc.energy_type),
+              proposalId
+            ).run();
+          }
 
           // B. Update Proposal Status & Time
           await env.DB.prepare(
@@ -500,6 +564,22 @@ export default {
 
           // Emit EVENT_POLICY_ISSUED (conceptually)
           return jsonResponse({ success: true, policyId, event: "EVENT_POLICY_ISSUED" });
+        }
+
+        // GET /api/proposal/payment-link?id=PROP-xxx
+        // For customer page to fetch the payment link after underwriting confirmation
+        if (pathname === "/api/proposal/payment-link" && request.method === "GET") {
+          const id = url.searchParams.get("id");
+          if (!id) return jsonResponse({ error: "Missing id" }, 400);
+
+          const decision = await env.DB.prepare(
+            "SELECT payment_qr_code FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
+          ).bind(id).first<any>();
+
+          return jsonResponse({
+            success: true,
+            paymentLink: decision?.payment_qr_code || null
+          });
         }
 
         // 2. Get Proposal Status (For UI polling)
