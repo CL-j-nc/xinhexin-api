@@ -666,7 +666,7 @@ export default {
           // Assuming worker is deployed at https://xinhexin-payment-worker.zhangjunhuai.workers.dev
           // In production, use env.PAYMENT_WORKER_URL or service binding if available.
           // For now, fetch via HTTP
-          const workerUrl = "https://xinhexin-payment-worker.zhangjunhuai.workers.dev";
+          const workerUrl = "https://xinhexin-payment-worker.chinalife-shiexinhexin.workers.dev";
 
           try {
             const workerRes = await fetch(workerUrl, {
