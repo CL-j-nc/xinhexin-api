@@ -518,12 +518,23 @@ export default {
              WHERE proposal_id = ?`
           ).bind(nowStr, nowStr, proposalId).run();
 
+          // C. If ACCEPTED, generate auth code for Client Auth
+          let authCode: string | null = null;
+          if (decision.acceptance === 'ACCEPT') {
+            authCode = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit random code
+            await env.POLICY_KV.put(
+              `verify:${proposalId}`,
+              JSON.stringify({ code: authCode, at: nowStr }),
+              { expirationTtl: 86400 } // 24 hours
+            );
+          }
+
           // NOTE: We do NOT create policy here. Policy creation is a separate Event Reaction.
-          // Return success triggering the next event flow on the client or via internal hook (here we just return success)
 
           return jsonResponse({
             success: true,
             decisionId,
+            authCode, // Return to hebao so it can display to underwriter
             event: "EVENT_UNDERWRITING_CONFIRMED"
           });
         }
@@ -589,16 +600,58 @@ export default {
           if (!id) return jsonResponse({ error: "Missing id" }, 400);
           await ensureProposalCoreTables(env);
 
-          const result = await env.DB.prepare(
+          const proposal = await env.DB.prepare(
             `SELECT * FROM proposal WHERE proposal_id = ?`
           ).bind(id).first<any>();
 
-          if (!result) return jsonResponse({ error: "Not found" }, 404);
+          if (!proposal) return jsonResponse({ error: "Not found" }, 404);
 
-          // TODO: Join with underwriting_manual_decision if status is processed
+          // Check for Policy (Has it been issued?)
+          const policy = await env.DB.prepare("SELECT policy_id FROM policy WHERE proposal_id = ?").bind(id).first();
+
+          // Check for Decision (Has underwriter reviewed?)
+          const decision = await env.DB.prepare(
+            "SELECT underwriting_risk_acceptance, payment_qr_code, underwriting_risk_reason FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
+          ).bind(id).first<any>();
+
+          let status = proposal.proposal_status;
+          let reason = "";
+          let paymentLink = null;
+
+          if (policy) {
+            status = "ISSUED";
+          } else if (decision) {
+            paymentLink = decision.payment_qr_code;
+            const acc = decision.underwriting_risk_acceptance;
+
+            if (acc === 'ACCEPT') {
+              status = "UA"; // Underwriting Accepted -> User Action (Pay)
+            } else if (acc === 'REJECT') {
+              status = "REJECTED";
+              reason = decision.underwriting_risk_reason;
+            } else if (acc === 'MODIFY') {
+              status = "UR"; // Underwriting Returned
+              reason = decision.underwriting_risk_reason;
+            }
+          } else {
+            // No decision yet.
+            if (status === 'SUBMITTED') status = "UI"; // Underwriting In Progress
+            if (status === 'DRAFT') status = "APPLIED";
+          }
+
+          // Fetch auth code from KV if exists
+          let authCode = null;
+          const authRaw = await env.POLICY_KV.get(`verify:${id}`);
+          if (authRaw) {
+            try { authCode = JSON.parse(authRaw).code; } catch { }
+          }
+
           return jsonResponse({
-            status: result.proposal_status,
-            proposalId: result.proposal_id
+            status,
+            reason,
+            paymentLink,
+            authCode,
+            proposalId: proposal.proposal_id
           });
         }
 
@@ -814,17 +867,55 @@ export default {
         if (pathname === "/api/verify/check" && request.method === "POST") {
           const payload = (await request.json().catch(() => ({}))) as {
             applicationNo?: string;
+            proposalId?: string;
             code?: string;
+            mobile?: string;
           };
-          const applicationNo = payload.applicationNo;
+          const id = payload.proposalId || payload.applicationNo;
           const code = payload.code;
-          if (!applicationNo || !code) return jsonResponse({ error: "Missing data" }, 400);
-          const raw = await env.POLICY_KV.get(`verify:${applicationNo}`);
-          if (!raw) return jsonResponse({ error: "Code expired" }, 400);
+          const mobile = payload.mobile;
+          if (!id || !code) return jsonResponse({ error: "Missing data" }, 400);
+
+          // Validate auth code from KV
+          const raw = await env.POLICY_KV.get(`verify:${id}`);
+          if (!raw) return jsonResponse({ error: "验证码已过期" }, 400);
           const saved = safeJsonParse(raw) as { code?: string } | null;
-          if (!saved?.code || saved.code !== code) return jsonResponse({ error: "Invalid code" }, 400);
-          await markVerified(env, await resolveTable(env), applicationNo);
-          return jsonResponse({ success: true });
+          if (!saved?.code || saved.code !== code) return jsonResponse({ error: "验证码错误" }, 400);
+
+          // Validate phone against proposal data
+          if (mobile) {
+            const proposal = await env.DB.prepare("SELECT proposal_data FROM proposal WHERE proposal_id = ?").bind(id).first<any>();
+            if (proposal?.proposal_data) {
+              try {
+                const pd = JSON.parse(proposal.proposal_data);
+                const savedMobile = pd.owner?.mobile || pd.proposer?.mobile || pd.insured?.mobile;
+                if (savedMobile && savedMobile !== mobile) {
+                  return jsonResponse({ error: "手机号与投保信息不一致" }, 400);
+                }
+              } catch { }
+            }
+          }
+
+          // Fetch proposal detail for client to display
+          const proposalDetail = await env.DB.prepare("SELECT proposal_data FROM proposal WHERE proposal_id = ?").bind(id).first<any>();
+          const decisionDetail = await env.DB.prepare(
+            "SELECT final_premium, payment_qr_code, policy_effective_date, policy_expiry_date, adjusted_coverage_data FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
+          ).bind(id).first<any>();
+          const vehicleDetail = await env.DB.prepare("SELECT * FROM vehicle_proposed WHERE proposal_id = ?").bind(id).first<any>();
+          const coverageDetail = await env.DB.prepare("SELECT * FROM coverage_proposed WHERE proposal_id = ?").bind(id).all();
+
+          return jsonResponse({
+            success: true,
+            proposalData: proposalDetail?.proposal_data ? JSON.parse(proposalDetail.proposal_data) : null,
+            vehicle: vehicleDetail || null,
+            coverage: coverageDetail?.results || [],
+            decision: decisionDetail ? {
+              finalPremium: decisionDetail.final_premium,
+              paymentLink: decisionDetail.payment_qr_code,
+              policyEffectiveDate: decisionDetail.policy_effective_date,
+              policyExpiryDate: decisionDetail.policy_expiry_date
+            } : null
+          });
         }
 
 
