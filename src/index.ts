@@ -602,6 +602,33 @@ export default {
           });
         }
 
+        // ==================== PAYMENT LINK GENERATION (NEW) ====================
+        // POST /api/payment/generate
+        // Proxy to xinhexin-payment-worker
+        if (pathname === "/api/payment/generate" && request.method === "POST") {
+          const payload = await request.json() as any;
+          // Validate logic if needed, but worker handles most
+
+          // Call Worker
+          // Assuming worker is deployed at https://xinhexin-payment-worker.zhangjunhuai.workers.dev
+          // In production, use env.PAYMENT_WORKER_URL or service binding if available.
+          // For now, fetch via HTTP
+          const workerUrl = "https://xinhexin-payment-worker.zhangjunhuai.workers.dev";
+
+          try {
+            const workerRes = await fetch(workerUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            const workerJson = await workerRes.json();
+            return jsonResponse(workerJson);
+          } catch (e) {
+            console.error("Payment Worker Error:", e);
+            return jsonResponse({ success: false, error: "Payment Service Unavailable" }, 502);
+          }
+        }
+
         // ==================== LEGACY ROUTES (KEEPING FOR COMPATIBILITY IF NEEDED) ====================
         if (pathname === "/api/upload" && request.method === "POST") {
           const formData = await request.formData();
@@ -799,6 +826,7 @@ export default {
           await markVerified(env, await resolveTable(env), applicationNo);
           return jsonResponse({ success: true });
         }
+
 
         return jsonResponse({ error: "Not Found" }, 404);
       } catch (err: any) {
