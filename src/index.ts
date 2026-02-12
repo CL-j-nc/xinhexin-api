@@ -1666,6 +1666,7 @@ interface UnifiedRecord {
   status: string;
   createdAt: string;
   data: any;
+  qrUrl?: string;
 }
 
 interface SearchCriteria {
@@ -1679,9 +1680,10 @@ interface SearchCriteria {
 async function loadProposalRecords(env: Env): Promise<UnifiedRecord[]> {
   await ensureProposalCoreTables(env);
   const { results } = await env.DB.prepare(
-    `SELECT proposal_id, proposal_status, application_submitted_at, created_at, proposal_data
-     FROM proposal
-     ORDER BY COALESCE(application_submitted_at, created_at) DESC
+    `SELECT p.proposal_id, p.proposal_status, p.application_submitted_at, p.created_at, p.proposal_data,
+            (SELECT payment_qr_code FROM underwriting_manual_decision amd WHERE amd.proposal_id = p.proposal_id ORDER BY underwriting_confirmed_at DESC LIMIT 1) as payment_qr_code
+     FROM proposal p
+     ORDER BY COALESCE(p.application_submitted_at, p.created_at) DESC
      LIMIT 200`
   ).all<any>();
 
@@ -1690,6 +1692,7 @@ async function loadProposalRecords(env: Env): Promise<UnifiedRecord[]> {
     status: row.proposal_status || "SUBMITTED",
     createdAt: row.application_submitted_at || row.created_at || now(),
     data: safeJsonParse(row.proposal_data) || {},
+    qrUrl: row.payment_qr_code
   }));
 }
 
@@ -1698,7 +1701,7 @@ async function loadLegacyRecords(env: Env): Promise<UnifiedRecord[]> {
 
   if (table === "applications") {
     const { results } = await env.DB.prepare(
-      `SELECT applicationNo, status, applyAt, dataJson
+      `SELECT applicationNo, status, applyAt, dataJson, clientToken
        FROM applications
        ORDER BY applyAt DESC
        LIMIT 200`
@@ -1709,6 +1712,7 @@ async function loadLegacyRecords(env: Env): Promise<UnifiedRecord[]> {
       status: row.status || "APPLIED",
       createdAt: row.applyAt || now(),
       data: safeJsonParse(row.dataJson) || {},
+      qrUrl: row.clientToken ? `https://xinhexin-p-hebao.pages.dev/#/buffer?token=${row.clientToken}` : undefined
     }));
   }
 
@@ -1719,12 +1723,16 @@ async function loadLegacyRecords(env: Env): Promise<UnifiedRecord[]> {
      LIMIT 200`
   ).all<any>();
 
-  return (results || []).map((row: any) => ({
-    applicationNo: row.application_no,
-    status: row.status || "APPLIED",
-    createdAt: row.applied_at || now(),
-    data: safeJsonParse(row.data) || {},
-  }));
+  return (results || []).map((row: any) => {
+    const data = safeJsonParse(row.data) || {};
+    return {
+      applicationNo: row.application_no,
+      status: row.status || "APPLIED",
+      createdAt: row.applied_at || now(),
+      data: data,
+      qrUrl: data.clientToken ? `https://xinhexin-p-hebao.pages.dev/#/buffer?token=${data.clientToken}` : undefined
+    };
+  });
 }
 
 async function listUnifiedHistory(env: Env) {
@@ -1744,6 +1752,7 @@ async function listUnifiedHistory(env: Env) {
       plate: item.data?.vehicle?.plate || "",
       brand: item.data?.vehicle?.brand || "",
       vehicle_type: item.data?.vehicle?.vehicleType || "",
+      qrUrl: item.qrUrl
     }));
 }
 
