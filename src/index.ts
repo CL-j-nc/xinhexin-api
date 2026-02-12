@@ -518,15 +518,18 @@ export default {
              WHERE proposal_id = ?`
           ).bind(nowStr, nowStr, proposalId).run();
 
-          // C. If ACCEPTED, generate auth code for Client Auth
+          // C. If ACCEPTED, generate auth code for Client Auth + QR URL
           let authCode: string | null = null;
+          let qrUrl: string | null = null;
           if (decision.acceptance === 'ACCEPT') {
             authCode = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit random code
             await env.POLICY_KV.put(
               `verify:${proposalId}`,
               JSON.stringify({ code: authCode, at: nowStr }),
-              { expirationTtl: 86400 } // 24 hours
+              { expirationTtl: 86400 * 30 } // 30 days
             );
+            // Generate one-vehicle-one-QR code URL
+            qrUrl = `https://chinalife-shie-xinhexin.pages.dev/#/buffer?id=${proposalId}`;
           }
 
           // NOTE: We do NOT create policy here. Policy creation is a separate Event Reaction.
@@ -534,7 +537,8 @@ export default {
           return jsonResponse({
             success: true,
             decisionId,
-            authCode, // Return to hebao so it can display to underwriter
+            authCode,
+            qrUrl,
             event: "EVENT_UNDERWRITING_CONFIRMED"
           });
         }
@@ -655,19 +659,156 @@ export default {
           });
         }
 
-        // ==================== PAYMENT LINK GENERATION (NEW) ====================
+        // ==================== PROPOSAL LIFECYCLE MANAGEMENT ====================
+
+        // GET /api/proposal/lifecycle?id=PROP-xxx
+        // Returns full lifecycle status, QR URL, auth code, timeline
+        if (pathname === "/api/proposal/lifecycle" && request.method === "GET") {
+          const id = url.searchParams.get("id");
+          if (!id) return jsonResponse({ error: "Missing id" }, 400);
+
+          const proposal = await env.DB.prepare(
+            "SELECT proposal_id, proposal_status, application_submitted_at, underwriting_confirmed_at, created_at, updated_at FROM proposal WHERE proposal_id = ?"
+          ).bind(id).first<any>();
+          if (!proposal) return jsonResponse({ error: "Not found" }, 404);
+
+          const decision = await env.DB.prepare(
+            "SELECT final_premium, policy_effective_date, policy_expiry_date, underwriter_name, underwriting_confirmed_at, underwriting_risk_acceptance, payment_qr_code FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
+          ).bind(id).first<any>();
+
+          const policy = await env.DB.prepare(
+            "SELECT policy_id, policy_issue_date FROM policy WHERE proposal_id = ?"
+          ).bind(id).first<any>();
+
+          const vehicle = await env.DB.prepare(
+            "SELECT plate_number, brand_model FROM vehicle_proposed WHERE proposal_id = ? LIMIT 1"
+          ).bind(id).first<any>();
+
+          // Auth code from KV
+          let authCode = null;
+          const authRaw = await env.POLICY_KV.get(`verify:${id}`);
+          if (authRaw) {
+            try { authCode = JSON.parse(authRaw).code; } catch { }
+          }
+
+          // QR URL
+          const qrUrl = (proposal.proposal_status === 'UNDERWRITING_CONFIRMED' || proposal.proposal_status === 'PAID')
+            ? `https://chinalife-shie-xinhexin.pages.dev/#/buffer?id=${id}`
+            : null;
+
+          // Determine lifecycle phase
+          let lifecyclePhase = proposal.proposal_status;
+          if (policy) lifecyclePhase = 'COMPLETED';
+
+          return jsonResponse({
+            success: true,
+            proposalId: id,
+            lifecyclePhase,
+            status: proposal.proposal_status,
+            qrUrl,
+            authCode,
+            vehicle: vehicle ? { plate: vehicle.plate_number, brand: vehicle.brand_model } : null,
+            decision: decision ? {
+              finalPremium: decision.final_premium,
+              effectiveDate: decision.policy_effective_date,
+              expiryDate: decision.policy_expiry_date,
+              acceptance: decision.underwriting_risk_acceptance,
+              paymentLink: decision.payment_qr_code,
+              underwriter: decision.underwriter_name,
+              confirmedAt: decision.underwriting_confirmed_at,
+            } : null,
+            policy: policy ? { policyId: policy.policy_id, issuedAt: policy.policy_issue_date } : null,
+            timeline: {
+              submittedAt: proposal.application_submitted_at,
+              confirmedAt: proposal.underwriting_confirmed_at,
+              paidAt: proposal.proposal_status === 'PAID' ? proposal.updated_at : null,
+              completedAt: policy ? policy.policy_issue_date : null,
+            }
+          });
+        }
+
+        // POST /api/proposal/lifecycle/update
+        // Underwriter actions: MARK_PAID, MARK_COMPLETED
+        if (pathname === "/api/proposal/lifecycle/update" && request.method === "POST") {
+          const payload = await request.json() as any;
+          const { proposalId, action } = payload;
+          if (!proposalId || !action) return jsonResponse({ error: "Missing proposalId or action" }, 400);
+
+          const proposal = await env.DB.prepare(
+            "SELECT proposal_status FROM proposal WHERE proposal_id = ?"
+          ).bind(proposalId).first<any>();
+          if (!proposal) return jsonResponse({ error: "Proposal not found" }, 404);
+
+          const nowStr = now();
+
+          if (action === 'MARK_PAID') {
+            if (proposal.proposal_status !== 'UNDERWRITING_CONFIRMED') {
+              return jsonResponse({ error: `Cannot mark PAID from status: ${proposal.proposal_status}` }, 400);
+            }
+            await env.DB.prepare(
+              "UPDATE proposal SET proposal_status = 'PAID', updated_at = ? WHERE proposal_id = ?"
+            ).bind(nowStr, proposalId).run();
+            return jsonResponse({ success: true, newStatus: 'PAID' });
+
+          } else if (action === 'MARK_COMPLETED') {
+            if (!['UNDERWRITING_CONFIRMED', 'PAID'].includes(proposal.proposal_status)) {
+              return jsonResponse({ error: `Cannot mark COMPLETED from status: ${proposal.proposal_status}` }, 400);
+            }
+            await env.DB.prepare(
+              "UPDATE proposal SET proposal_status = 'COMPLETED', updated_at = ? WHERE proposal_id = ?"
+            ).bind(nowStr, proposalId).run();
+            // Invalidate auth code (QR becomes expired)
+            await env.POLICY_KV.delete(`verify:${proposalId}`);
+            return jsonResponse({ success: true, newStatus: 'COMPLETED' });
+
+          } else {
+            return jsonResponse({ error: `Unknown action: ${action}` }, 400);
+          }
+        }
+
+        // GET /api/proposal/lifecycle/check?id=PROP-xxx
+        // Lightweight check for client side (no auth required)
+        // Returns only status + vehicle basic info + expiry message
+        if (pathname === "/api/proposal/lifecycle/check" && request.method === "GET") {
+          const id = url.searchParams.get("id");
+          if (!id) return jsonResponse({ error: "Missing id" }, 400);
+
+          const proposal = await env.DB.prepare(
+            "SELECT proposal_status FROM proposal WHERE proposal_id = ?"
+          ).bind(id).first<any>();
+          if (!proposal) return jsonResponse({ error: "Not found" }, 404);
+
+          const vehicle = await env.DB.prepare(
+            "SELECT plate_number, brand_model FROM vehicle_proposed WHERE proposal_id = ? LIMIT 1"
+          ).bind(id).first<any>();
+
+          let expired = false;
+          let message = "";
+          if (proposal.proposal_status === 'COMPLETED') {
+            expired = true;
+            message = "感谢您的投保，电子保单将以电子链接的形式发送至您所绑定的企业号。如有疑问请拨打客服热线 95519。";
+          } else if (proposal.proposal_status === 'REJECTED') {
+            expired = true;
+            message = "很抱歉，您的投保申请未通过核保审核。如有疑问请联系您的业务员或拨打客服热线 95519。";
+          } else if (proposal.proposal_status === 'SUBMITTED') {
+            expired = true;
+            message = "您的投保申请正在核保审核中，请耐心等待。";
+          }
+
+          return jsonResponse({
+            success: true,
+            status: proposal.proposal_status,
+            expired,
+            message,
+            vehicle: vehicle ? { plate: vehicle.plate_number, brand: vehicle.brand_model } : null,
+          });
+        }
+
+        // ==================== PAYMENT LINK GENERATION ====================
         // POST /api/payment/generate
-        // Proxy to xinhexin-payment-worker
         if (pathname === "/api/payment/generate" && request.method === "POST") {
           const payload = await request.json() as any;
-          // Validate logic if needed, but worker handles most
-
-          // Call Worker
-          // Assuming worker is deployed at https://xinhexin-payment-worker.zhangjunhuai.workers.dev
-          // In production, use env.PAYMENT_WORKER_URL or service binding if available.
-          // For now, fetch via HTTP
           const workerUrl = "https://xinhexin-payment-worker.chinalife-shiexinhexin.workers.dev";
-
           try {
             const workerRes = await fetch(workerUrl, {
               method: 'POST',
@@ -875,6 +1016,25 @@ export default {
           const code = payload.code;
           const mobile = payload.mobile;
           if (!id || !code) return jsonResponse({ error: "Missing data" }, 400);
+
+          // Lifecycle check: if proposal is COMPLETED, show thank-you message
+          const lifecycleCheck = await env.DB.prepare(
+            "SELECT proposal_status FROM proposal WHERE proposal_id = ?"
+          ).bind(id).first<any>();
+          if (lifecycleCheck?.proposal_status === 'COMPLETED') {
+            return jsonResponse({
+              success: false,
+              expired: true,
+              message: "感谢您的投保，电子保单将以电子链接的形式发送至您所绑定的企业号。如有疑问请拨打客服热线 95519。"
+            });
+          }
+          if (lifecycleCheck?.proposal_status === 'REJECTED') {
+            return jsonResponse({
+              success: false,
+              expired: true,
+              message: "很抱歉，您的投保申请未通过核保审核。如有疑问请联系您的业务员或拨打客服热线 95519。"
+            });
+          }
 
           // Validate auth code from KV
           const raw = await env.POLICY_KV.get(`verify:${id}`);
