@@ -29,10 +29,19 @@ function generateReportNo(): string {
 
 // 验证保单并获取被保人信息
 async function validatePolicy(env: Env, policyNo: string) {
+    // 查询新架构 policy 表，并 JOIN proposal 获取投保人信息
     const policy = await env.DB.prepare(
         `
-    SELECT policy_no, status, owner_name, owner_id_card, effective_date, expiry_date
-    FROM policy WHERE policy_no = ?
+    SELECT
+        p.policy_id,
+        p.policy_status,
+        p.policy_effective_date,
+        p.policy_expiry_date,
+        p.proposal_id,
+        pr.proposal_data
+    FROM policy p
+    LEFT JOIN proposal pr ON p.proposal_id = pr.proposal_id
+    WHERE p.policy_id = ?
     `
     )
         .bind(policyNo)
@@ -42,19 +51,44 @@ async function validatePolicy(env: Env, policyNo: string) {
         return { valid: false, error: "保单不存在" };
     }
 
-    if (policy.status !== "ACTIVE") {
+    if (policy.policy_status !== "EFFECTIVE") {
         return { valid: false, error: "保单状态无效，无法报案" };
     }
 
     const now = new Date();
-    const effective = new Date(policy.effective_date);
-    const expiry = new Date(policy.expiry_date);
+    const effective = new Date(policy.policy_effective_date);
+    const expiry = new Date(policy.policy_expiry_date);
 
     if (now < effective || now > expiry) {
         return { valid: false, error: "保单不在有效期内" };
     }
 
-    return { valid: true, policy };
+    // 从 proposal_data 解析投保人/车主信息（兼容旧调用方）
+    let ownerName = "";
+    let ownerIdCard = "";
+    if (policy.proposal_data) {
+        try {
+            const data = JSON.parse(policy.proposal_data);
+            ownerName = data?.owner?.name || data?.proposer?.name || "";
+            ownerIdCard = data?.owner?.idCard || data?.proposer?.idCard || "";
+        } catch (e) {
+            // JSON 解析失败，忽略
+        }
+    }
+
+    return {
+        valid: true,
+        policy: {
+            ...policy,
+            // 兼容字段映射（供下游使用）
+            policy_no: policy.policy_id,
+            status: policy.policy_status,
+            effective_date: policy.policy_effective_date,
+            expiry_date: policy.policy_expiry_date,
+            owner_name: ownerName,
+            owner_id_card: ownerIdCard
+        }
+    };
 }
 
 // 创建报案（草稿）
