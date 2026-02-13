@@ -30,6 +30,22 @@ const normalizeDbNumber = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+// 手机号标准化：移除非数字字符，处理+86前缀
+const normalizePhone = (phone: string | null | undefined): string => {
+  if (!phone) return '';
+  // 移除所有非数字字符
+  let normalized = String(phone).replace(/\D/g, '');
+  // 移除国际区号 86
+  if (normalized.startsWith('86') && normalized.length === 13) {
+    normalized = normalized.slice(2);
+  }
+  // 验证是否为11位手机号
+  if (normalized.length !== 11 || !normalized.startsWith('1')) {
+    return ''; // 无效手机号返回空
+  }
+  return normalized;
+};
+
 let cachedTable: TableKind | null = null;
 let draftTableReady = false;
 let proposalCoreSchemaReady = false;
@@ -426,6 +442,60 @@ export default {
           });
         }
 
+        // 3.1 GET /api/underwriting/history - 核保历史记录（包含 QR/验证码）
+        if (pathname === "/api/underwriting/history" && request.method === "GET") {
+          const { results } = await env.DB.prepare(`
+            SELECT
+              d.decision_id,
+              d.proposal_id,
+              d.underwriting_risk_acceptance as acceptance,
+              d.underwriting_risk_reason as reason,
+              d.underwriting_confirmed_at,
+              d.final_premium,
+              d.auth_code,
+              d.qr_url,
+              d.owner_mobile,
+              p.proposal_status,
+              v.plate_number,
+              v.brand_model
+            FROM underwriting_manual_decision d
+            JOIN proposal p ON d.proposal_id = p.proposal_id
+            LEFT JOIN vehicle_proposed v ON d.proposal_id = v.proposal_id
+            WHERE d.underwriting_risk_acceptance IS NOT NULL
+            ORDER BY d.underwriting_confirmed_at DESC
+            LIMIT 200
+          `).all();
+          return jsonResponse({ success: true, results: results || [] });
+        }
+
+        // 3.2 GET /api/underwriting/by-phone?mobile=138xxxx - 按手机号查询核保历史
+        if (pathname === "/api/underwriting/by-phone" && request.method === "GET") {
+          const mobile = url.searchParams.get("mobile");
+          if (!mobile) return jsonResponse({ error: "缺少手机号参数" }, 400);
+
+          const normalizedMobile = normalizePhone(mobile);
+          if (!normalizedMobile) return jsonResponse({ error: "手机号格式无效" }, 400);
+
+          const { results } = await env.DB.prepare(`
+            SELECT
+              d.decision_id,
+              d.proposal_id,
+              d.underwriting_risk_acceptance as acceptance,
+              d.underwriting_confirmed_at,
+              d.auth_code,
+              d.qr_url,
+              p.proposal_status,
+              v.plate_number,
+              v.brand_model
+            FROM underwriting_manual_decision d
+            JOIN proposal p ON d.proposal_id = p.proposal_id
+            LEFT JOIN vehicle_proposed v ON d.proposal_id = v.proposal_id
+            WHERE d.owner_mobile = ?
+            ORDER BY d.underwriting_confirmed_at DESC
+          `).bind(normalizedMobile).all();
+          return jsonResponse({ success: true, results: results || [] });
+        }
+
         // 4. Underwriting Decision (Manual)
         // POST /api/underwriting/decision
         // - Allow modification of ALL time fields
@@ -460,10 +530,28 @@ export default {
             await env.DB.batch(batch);
           }
 
-          // A. Insert Manual Decision Record
+          // A-1. 提前生成 authCode 和 qrUrl（如果 ACCEPT），以便写入 DB
+          let authCode: string | null = null;
+          let qrUrl: string | null = null;
+          if (decision.acceptance === 'ACCEPT') {
+            authCode = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit random code
+            qrUrl = `https://chinalife-shie-xinhexin.pages.dev/#/buffer?id=${proposalId}`;
+          }
+
+          // A-2. 从 proposal_data 提取 owner_mobile（手机号作为业务锚点）
+          let ownerMobile: string | null = null;
+          const proposalRow = await env.DB.prepare("SELECT proposal_data FROM proposal WHERE proposal_id = ?").bind(proposalId).first<any>();
+          if (proposalRow?.proposal_data) {
+            try {
+              const pd = JSON.parse(proposalRow.proposal_data);
+              ownerMobile = normalizePhone(pd.owner?.mobile || pd.proposer?.mobile || pd.insured?.mobile || '');
+            } catch { ownerMobile = null; }
+          }
+
+          // A. Insert Manual Decision Record (包含 auth_code, qr_url, owner_mobile)
           await env.DB.prepare(`
           INSERT INTO underwriting_manual_decision (
-            decision_id, proposal_id, 
+            decision_id, proposal_id,
             final_premium, policy_effective_date, policy_expiry_date,
             underwriter_name, underwriter_id, underwriting_confirmed_at,
             underwriting_risk_level, underwriting_risk_reason, underwriting_risk_acceptance,
@@ -471,8 +559,9 @@ export default {
             loss_history_estimation, loss_history_basis, ncd_assumption,
             premium_adjustment_reason, coverage_adjustment_flag, coverage_adjustment_detail,
             special_exception_flag, special_exception_description,
-            payment_qr_code, adjusted_coverage_data
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            payment_qr_code, adjusted_coverage_data,
+            auth_code, qr_url, owner_mobile
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
             decisionId, proposalId,
             decision.finalPremium, decision.policyEffectiveDate, decision.policyExpiryDate, // Underwriter Modified Times
@@ -483,7 +572,8 @@ export default {
             decision.premiumReason || "N/A",
             decision.coverageFlag || 0, decision.coverageDetail || "",
             decision.exceptionFlag || 0, decision.exceptionDesc || "",
-            paymentLink || paymentQrCode || null, JSON.stringify(coverages || [])
+            paymentLink || paymentQrCode || null, JSON.stringify(coverages || []),
+            authCode, qrUrl, ownerMobile || null
           ).run();
 
           // A1. Update proposal_data with person edits if provided
@@ -513,23 +603,18 @@ export default {
 
           // B. Update Proposal Status & Time
           await env.DB.prepare(
-            `UPDATE proposal 
-             SET proposal_status = 'UNDERWRITING_CONFIRMED', underwriting_confirmed_at = ?, updated_at = ? 
+            `UPDATE proposal
+             SET proposal_status = 'UNDERWRITING_CONFIRMED', underwriting_confirmed_at = ?, updated_at = ?
              WHERE proposal_id = ?`
           ).bind(nowStr, nowStr, proposalId).run();
 
-          // C. If ACCEPTED, generate auth code for Client Auth + QR URL
-          let authCode: string | null = null;
-          let qrUrl: string | null = null;
-          if (decision.acceptance === 'ACCEPT') {
-            authCode = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit random code
+          // C. 同时写入 KV（兼容旧流程，30天后自动过期）
+          if (authCode) {
             await env.POLICY_KV.put(
               `verify:${proposalId}`,
               JSON.stringify({ code: authCode, at: nowStr }),
               { expirationTtl: 86400 * 30 } // 30 days
             );
-            // Generate one-vehicle-one-QR code URL
-            qrUrl = `https://chinalife-shie-xinhexin.pages.dev/#/buffer?id=${proposalId}`;
           }
 
           // NOTE: We do NOT create policy here. Policy creation is a separate Event Reaction.
@@ -613,9 +698,9 @@ export default {
           // Check for Policy (Has it been issued?)
           const policy = await env.DB.prepare("SELECT policy_id FROM policy WHERE proposal_id = ?").bind(id).first();
 
-          // Check for Decision (Has underwriter reviewed?)
+          // Check for Decision (Has underwriter reviewed?) - 现在包含 auth_code 和 qr_url
           const decision = await env.DB.prepare(
-            "SELECT underwriting_risk_acceptance, payment_qr_code, underwriting_risk_reason FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
+            "SELECT underwriting_risk_acceptance, payment_qr_code, underwriting_risk_reason, auth_code, qr_url FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
           ).bind(id).first<any>();
 
           let status = proposal.proposal_status;
@@ -643,11 +728,16 @@ export default {
             if (status === 'DRAFT') status = "APPLIED";
           }
 
-          // Fetch auth code from KV if exists
-          let authCode = null;
-          const authRaw = await env.POLICY_KV.get(`verify:${id}`);
-          if (authRaw) {
-            try { authCode = JSON.parse(authRaw).code; } catch { }
+          // 优先从 DB 读取 authCode 和 qrUrl
+          let authCode = decision?.auth_code || null;
+          let qrUrl = decision?.qr_url || null;
+
+          // 如果 DB 没有，降级到 KV（兼容旧数据）
+          if (!authCode) {
+            const authRaw = await env.POLICY_KV.get(`verify:${id}`);
+            if (authRaw) {
+              try { authCode = JSON.parse(authRaw).code; } catch { }
+            }
           }
 
           return jsonResponse({
@@ -655,6 +745,7 @@ export default {
             reason,
             paymentLink,
             authCode,
+            qrUrl,
             proposalId: proposal.proposal_id
           });
         }
@@ -1015,9 +1106,19 @@ export default {
           const id = payload.proposalId || payload.applicationNo;
           const code = payload.code;
           const mobile = payload.mobile;
-          if (!id || !code) return jsonResponse({ error: "Missing data" }, 400);
 
-          // Lifecycle check: if proposal is COMPLETED, show thank-you message
+          // 1. 基础校验 - 明确错误信息
+          if (!id) return jsonResponse({ error: "缺少投保单号" }, 400);
+          if (!code) return jsonResponse({ error: "缺少验证码" }, 400);
+          if (!mobile) return jsonResponse({ error: "缺少手机号" }, 400);
+
+          // 2. 手机号标准化
+          const normalizedInputMobile = normalizePhone(mobile);
+          if (!normalizedInputMobile) {
+            return jsonResponse({ error: "手机号格式无效，请输入11位手机号" }, 400);
+          }
+
+          // 3. Lifecycle check: if proposal is COMPLETED, show thank-you message
           const lifecycleCheck = await env.DB.prepare(
             "SELECT proposal_status FROM proposal WHERE proposal_id = ?"
           ).bind(id).first<any>();
@@ -1036,27 +1137,60 @@ export default {
             });
           }
 
-          // Validate auth code from KV
-          const raw = await env.POLICY_KV.get(`verify:${id}`);
-          if (!raw) return jsonResponse({ error: "验证码已过期" }, 400);
-          const saved = safeJsonParse(raw) as { code?: string } | null;
-          if (!saved?.code || saved.code !== code) return jsonResponse({ error: "验证码错误" }, 400);
+          // 4. 优先从 DB 读取验证码（新逻辑）
+          const dbDecision = await env.DB.prepare(`
+            SELECT auth_code, owner_mobile FROM underwriting_manual_decision
+            WHERE proposal_id = ? AND underwriting_risk_acceptance = 'ACCEPT'
+            ORDER BY underwriting_confirmed_at DESC LIMIT 1
+          `).bind(id).first<any>();
 
-          // Validate phone against proposal data
-          if (mobile) {
-            const proposal = await env.DB.prepare("SELECT proposal_data FROM proposal WHERE proposal_id = ?").bind(id).first<any>();
-            if (proposal?.proposal_data) {
-              try {
-                const pd = JSON.parse(proposal.proposal_data);
-                const savedMobile = pd.owner?.mobile || pd.proposer?.mobile || pd.insured?.mobile;
-                if (savedMobile && savedMobile !== mobile) {
-                  return jsonResponse({ error: "手机号与投保信息不一致" }, 400);
-                }
-              } catch { }
+          let savedCode = dbDecision?.auth_code;
+          let savedMobile = dbDecision?.owner_mobile;
+
+          // 5. 如果 DB 无数据，降级到 KV（兼容旧数据）
+          if (!savedCode) {
+            const raw = await env.POLICY_KV.get(`verify:${id}`);
+            if (raw) {
+              const kv = safeJsonParse(raw) as { code?: string } | null;
+              savedCode = kv?.code;
             }
           }
 
-          // Fetch proposal detail for client to display
+          if (!savedCode) {
+            return jsonResponse({ error: "验证码已过期或投保单号无效" }, 400);
+          }
+
+          // 6. 验证码校验
+          if (savedCode !== code) {
+            return jsonResponse({ error: "验证码错误" }, 400);
+          }
+
+          // 7. 手机号校验（如果 DB 有记录）
+          if (savedMobile && savedMobile !== normalizedInputMobile) {
+            // 降级: 从 proposal_data 检查所有手机号
+            const proposal = await env.DB.prepare(
+              "SELECT proposal_data FROM proposal WHERE proposal_id = ?"
+            ).bind(id).first<any>();
+
+            if (proposal?.proposal_data) {
+              try {
+                const pd = JSON.parse(proposal.proposal_data);
+                const allMobiles = [
+                  normalizePhone(pd.owner?.mobile || ''),
+                  normalizePhone(pd.proposer?.mobile || ''),
+                  normalizePhone(pd.insured?.mobile || '')
+                ].filter(Boolean);
+
+                if (!allMobiles.includes(normalizedInputMobile)) {
+                  return jsonResponse({ error: "手机号与投保信息不一致" }, 400);
+                }
+              } catch {
+                return jsonResponse({ error: "手机号与投保信息不一致" }, 400);
+              }
+            }
+          }
+
+          // 8. Fetch proposal detail for client to display
           const proposalDetail = await env.DB.prepare("SELECT proposal_data FROM proposal WHERE proposal_id = ?").bind(id).first<any>();
           const decisionDetail = await env.DB.prepare(
             "SELECT final_premium, payment_qr_code, policy_effective_date, policy_expiry_date, adjusted_coverage_data FROM underwriting_manual_decision WHERE proposal_id = ? ORDER BY underwriting_confirmed_at DESC LIMIT 1"
