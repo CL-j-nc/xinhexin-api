@@ -496,6 +496,62 @@ export default {
           return jsonResponse({ success: true, results: results || [] });
         }
 
+        // 3.3 POST /api/underwriting/resend-auth - 重发验证码
+        // 供客服人员在客户收不到验证码时重新生成
+        if (pathname === "/api/underwriting/resend-auth" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const { proposalId, operatorId, reason } = payload;
+
+          if (!proposalId) {
+            return jsonResponse({ error: "缺少投保单号" }, 400);
+          }
+
+          // 1. 查询核保决策记录
+          const decision = await env.DB.prepare(`
+            SELECT decision_id, underwriting_risk_acceptance, owner_mobile
+            FROM underwriting_manual_decision
+            WHERE proposal_id = ?
+            ORDER BY underwriting_confirmed_at DESC
+            LIMIT 1
+          `).bind(proposalId).first<any>();
+
+          if (!decision) {
+            return jsonResponse({ error: "未找到该投保单的核保记录" }, 404);
+          }
+
+          if (decision.underwriting_risk_acceptance !== 'ACCEPT') {
+            return jsonResponse({ error: "只有核保通过的投保单才能重发验证码" }, 400);
+          }
+
+          // 2. 生成新的6位验证码
+          const newAuthCode = String(Math.floor(100000 + Math.random() * 900000));
+          const qrUrl = `https://chinalife-shie-xinhexin.pages.dev/#/buffer?id=${proposalId}`;
+
+          // 3. 更新数据库中的验证码
+          await env.DB.prepare(`
+            UPDATE underwriting_manual_decision
+            SET auth_code = ?, qr_url = ?
+            WHERE decision_id = ?
+          `).bind(newAuthCode, qrUrl, decision.decision_id).run();
+
+          // 4. 同步更新 KV（兼容旧流程）
+          await env.POLICY_KV.put(
+            `verify:${proposalId}`,
+            JSON.stringify({ code: newAuthCode, mobile: decision.owner_mobile }),
+            { expirationTtl: QR_TTL }
+          );
+
+          // 5. 记录操作日志（可选：写入审计表）
+          console.log(`[RESEND_AUTH] proposalId=${proposalId}, operatorId=${operatorId || 'unknown'}, reason=${reason || 'none'}, newCode=${newAuthCode}`);
+
+          return jsonResponse({
+            success: true,
+            authCode: newAuthCode,
+            qrUrl,
+            message: "验证码已重新生成"
+          });
+        }
+
         // 4. Underwriting Decision (Manual)
         // POST /api/underwriting/decision
         // - Allow modification of ALL time fields
