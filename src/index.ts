@@ -694,7 +694,140 @@ export default {
           });
         }
 
-        // 3.6 GET /api/admin/audit-log
+        // 3.6 POST /api/admin/submit-claim
+        // L2+ 代客户提交理赔
+        if (pathname === "/api/admin/submit-claim" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const {
+            policyId,
+            operatorId,
+            operatorRole,
+            claimType,
+            claimAmount,
+            claimDescription,
+            authorizationType,
+            authorizationNote
+          } = payload;
+
+          // 参数校验
+          if (!policyId) return jsonResponse({ error: "缺少保单号" }, 400);
+          if (!operatorId) return jsonResponse({ error: "缺少操作人ID" }, 400);
+          if (!operatorRole || !['L2', 'L3'].includes(operatorRole)) {
+            return jsonResponse({ error: "无权限：仅 L2 及以上角色可执行此操作" }, 403);
+          }
+          if (!claimType) return jsonResponse({ error: "请选择理赔类型" }, 400);
+          if (!claimDescription || claimDescription.length < 20) {
+            return jsonResponse({ error: "理赔描述至少需要20个字符" }, 400);
+          }
+          if (!authorizationType || !['VERBAL', 'WRITTEN'].includes(authorizationType)) {
+            return jsonResponse({ error: "请选择授权方式" }, 400);
+          }
+
+          // 生成理赔单号
+          const claimId = `CLM-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+          const nowStr = now();
+
+          // 记录理赔信息
+          const beforeState = { policy_id: policyId, claim_status: null };
+          const afterState = {
+            policy_id: policyId,
+            claim_id: claimId,
+            claim_type: claimType,
+            claim_amount: claimAmount,
+            claim_status: 'SUBMITTED',
+            submitted_by: operatorId,
+            submitted_at: nowStr,
+            authorization_type: authorizationType
+          };
+
+          // 写入审计日志
+          const logId = `AOL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+            INSERT INTO admin_operation_log (
+              id, operator_id, operator_role, power_type, action,
+              target_type, target_id, reason, before_state, after_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            logId,
+            operatorId,
+            operatorRole,
+            'SUBSTITUTION',
+            'SUBMIT_CLAIM',
+            'POLICY',
+            policyId,
+            `${authorizationType === 'VERBAL' ? '口头授权' : '书面授权'}: ${authorizationNote || claimDescription.slice(0, 50)}`,
+            JSON.stringify(beforeState),
+            JSON.stringify(afterState)
+          ).run();
+
+          return jsonResponse({
+            success: true,
+            claimId,
+            auditLogId: logId,
+            message: "理赔申请已提交"
+          });
+        }
+
+        // 3.7 POST /api/admin/correct-data
+        // L1+ 数据纠错
+        if (pathname === "/api/admin/correct-data" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const {
+            targetType,
+            targetId,
+            operatorId,
+            operatorRole,
+            fieldName,
+            oldValue,
+            newValue,
+            reason
+          } = payload;
+
+          // 参数校验
+          if (!targetType || !['PROPOSAL', 'POLICY', 'CUSTOMER'].includes(targetType)) {
+            return jsonResponse({ error: "无效的目标类型" }, 400);
+          }
+          if (!targetId) return jsonResponse({ error: "缺少目标ID" }, 400);
+          if (!operatorId) return jsonResponse({ error: "缺少操作人ID" }, 400);
+          if (!operatorRole || !['L1', 'L2', 'L3'].includes(operatorRole)) {
+            return jsonResponse({ error: "无权限：仅 L1 及以上角色可执行此操作" }, 403);
+          }
+          if (!fieldName) return jsonResponse({ error: "请指定修改字段" }, 400);
+          if (!reason || reason.length < 10) {
+            return jsonResponse({ error: "修改理由至少需要10个字符" }, 400);
+          }
+
+          const beforeState = { [fieldName]: oldValue };
+          const afterState = { [fieldName]: newValue };
+
+          // 写入审计日志
+          const logId = `AOL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+            INSERT INTO admin_operation_log (
+              id, operator_id, operator_role, power_type, action,
+              target_type, target_id, reason, before_state, after_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            logId,
+            operatorId,
+            operatorRole,
+            'CORRECTION',
+            'CORRECT_DATA',
+            targetType,
+            targetId,
+            reason,
+            JSON.stringify(beforeState),
+            JSON.stringify(afterState)
+          ).run();
+
+          return jsonResponse({
+            success: true,
+            auditLogId: logId,
+            message: "数据已修正"
+          });
+        }
+
+        // 3.8 GET /api/admin/audit-log
         // 查询审计日志
         if (pathname === "/api/admin/audit-log" && request.method === "GET") {
           const url = new URL(request.url);
