@@ -827,7 +827,279 @@ export default {
           });
         }
 
-        // 3.8 GET /api/admin/audit-log
+        // 3.8 POST /api/admin/substitute-payment
+        // L3 代客户支付（高风险，需书面授权+双人复核）
+        if (pathname === "/api/admin/substitute-payment" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const {
+            proposalId,
+            operatorId,
+            operatorRole,
+            paymentAmount,
+            paymentMethod,
+            authorizationUrl,
+            reason,
+            reviewerId
+          } = payload;
+
+          // 参数校验
+          if (!proposalId) return jsonResponse({ error: "缺少投保单号" }, 400);
+          if (!operatorId) return jsonResponse({ error: "缺少操作人ID" }, 400);
+          if (operatorRole !== 'L3') {
+            return jsonResponse({ error: "无权限：仅 L3 可执行代支付操作" }, 403);
+          }
+          if (!paymentAmount || paymentAmount <= 0) {
+            return jsonResponse({ error: "请输入有效的支付金额" }, 400);
+          }
+          if (!authorizationUrl) {
+            return jsonResponse({ error: "代支付需上传书面授权凭证" }, 400);
+          }
+          if (!reason || reason.length < 10) {
+            return jsonResponse({ error: "操作理由至少需要10个字符" }, 400);
+          }
+          if (!reviewerId) {
+            return jsonResponse({ error: "L3 操作需要指定复核人" }, 400);
+          }
+          if (reviewerId === operatorId) {
+            return jsonResponse({ error: "复核人不能是操作人本人" }, 400);
+          }
+
+          // 查询投保单
+          const proposal = await env.DB.prepare(
+            "SELECT proposal_id, proposal_status FROM proposal WHERE proposal_id = ?"
+          ).bind(proposalId).first<any>();
+
+          if (!proposal) {
+            return jsonResponse({ error: "投保单不存在" }, 404);
+          }
+
+          // 状态校验
+          if (proposal.proposal_status !== 'UNDERWRITING_CONFIRMED') {
+            return jsonResponse({ error: `当前状态(${proposal.proposal_status})不允许支付` }, 400);
+          }
+
+          const nowStr = now();
+          const beforeState = {
+            proposal_status: proposal.proposal_status,
+            paid: false
+          };
+          const afterState = {
+            proposal_status: 'PAID',
+            paid: true,
+            paid_by: operatorId,
+            paid_at: nowStr,
+            payment_amount: paymentAmount,
+            payment_method: paymentMethod || 'SUBSTITUTE'
+          };
+
+          // 更新投保单状态
+          await env.DB.prepare(
+            "UPDATE proposal SET proposal_status = 'PAID', updated_at = ? WHERE proposal_id = ?"
+          ).bind(nowStr, proposalId).run();
+
+          // 写入审计日志
+          const logId = `AOL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+            INSERT INTO admin_operation_log (
+              id, operator_id, operator_role, power_type, action,
+              target_type, target_id, reason, before_state, after_state,
+              authorization_url, reviewer_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            logId,
+            operatorId,
+            operatorRole,
+            'SUBSTITUTION',
+            'PAYMENT',
+            'PROPOSAL',
+            proposalId,
+            reason.trim(),
+            JSON.stringify(beforeState),
+            JSON.stringify(afterState),
+            authorizationUrl,
+            reviewerId
+          ).run();
+
+          return jsonResponse({
+            success: true,
+            auditLogId: logId,
+            newStatus: 'PAID',
+            message: "代支付完成，待复核人确认"
+          });
+        }
+
+        // 3.9 POST /api/admin/substitute-surrender
+        // L3 代客户退保（高风险，需书面授权+双人复核）
+        if (pathname === "/api/admin/substitute-surrender" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const {
+            policyId,
+            operatorId,
+            operatorRole,
+            surrenderReason,
+            refundAmount,
+            authorizationUrl,
+            reason,
+            reviewerId
+          } = payload;
+
+          // 参数校验
+          if (!policyId) return jsonResponse({ error: "缺少保单号" }, 400);
+          if (!operatorId) return jsonResponse({ error: "缺少操作人ID" }, 400);
+          if (operatorRole !== 'L3') {
+            return jsonResponse({ error: "无权限：仅 L3 可执行代退保操作" }, 403);
+          }
+          if (!surrenderReason) {
+            return jsonResponse({ error: "请选择退保原因" }, 400);
+          }
+          if (!authorizationUrl) {
+            return jsonResponse({ error: "代退保需上传书面授权/放弃声明凭证" }, 400);
+          }
+          if (!reason || reason.length < 10) {
+            return jsonResponse({ error: "操作理由至少需要10个字符" }, 400);
+          }
+          if (!reviewerId) {
+            return jsonResponse({ error: "L3 操作需要指定复核人" }, 400);
+          }
+          if (reviewerId === operatorId) {
+            return jsonResponse({ error: "复核人不能是操作人本人" }, 400);
+          }
+
+          const nowStr = now();
+          const surrenderId = `SUR-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+
+          const beforeState = {
+            policy_id: policyId,
+            policy_status: 'EFFECTIVE'
+          };
+          const afterState = {
+            policy_id: policyId,
+            policy_status: 'SURRENDERED',
+            surrender_id: surrenderId,
+            surrender_reason: surrenderReason,
+            refund_amount: refundAmount,
+            surrendered_by: operatorId,
+            surrendered_at: nowStr
+          };
+
+          // 写入审计日志
+          const logId = `AOL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+            INSERT INTO admin_operation_log (
+              id, operator_id, operator_role, power_type, action,
+              target_type, target_id, reason, before_state, after_state,
+              authorization_url, reviewer_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            logId,
+            operatorId,
+            operatorRole,
+            'SUBSTITUTION',
+            'SURRENDER',
+            'POLICY',
+            policyId,
+            reason.trim(),
+            JSON.stringify(beforeState),
+            JSON.stringify(afterState),
+            authorizationUrl,
+            reviewerId
+          ).run();
+
+          return jsonResponse({
+            success: true,
+            auditLogId: logId,
+            surrenderId,
+            message: "代退保申请已提交，待复核人确认"
+          });
+        }
+
+        // 3.10 POST /api/admin/review-confirm
+        // 复核人确认L3操作
+        if (pathname === "/api/admin/review-confirm" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const { auditLogId, reviewerId, reviewerRole, approved, rejectReason } = payload;
+
+          if (!auditLogId) return jsonResponse({ error: "缺少审计日志ID" }, 400);
+          if (!reviewerId) return jsonResponse({ error: "缺少复核人ID" }, 400);
+          if (!reviewerRole || !['L2', 'L3'].includes(reviewerRole)) {
+            return jsonResponse({ error: "无权限：仅 L2 及以上可复核" }, 403);
+          }
+
+          // 查询审计日志
+          const log = await env.DB.prepare(
+            "SELECT * FROM admin_operation_log WHERE id = ?"
+          ).bind(auditLogId).first<any>();
+
+          if (!log) {
+            return jsonResponse({ error: "审计记录不存在" }, 404);
+          }
+          if (log.reviewer_id !== reviewerId) {
+            return jsonResponse({ error: "您不是指定的复核人" }, 403);
+          }
+          if (log.reviewed_at) {
+            return jsonResponse({ error: "该操作已完成复核" }, 400);
+          }
+
+          const nowStr = now();
+
+          if (approved) {
+            // 确认通过
+            await env.DB.prepare(
+              "UPDATE admin_operation_log SET reviewed_at = ? WHERE id = ?"
+            ).bind(nowStr, auditLogId).run();
+
+            return jsonResponse({
+              success: true,
+              message: "复核确认通过"
+            });
+          } else {
+            // 复核拒绝 - 需要回滚操作
+            const afterState = safeJsonParse(log.after_state) || {};
+
+            // 如果是代支付，回滚状态
+            if (log.action === 'PAYMENT' && afterState.proposal_status === 'PAID') {
+              await env.DB.prepare(
+                "UPDATE proposal SET proposal_status = 'UNDERWRITING_CONFIRMED', updated_at = ? WHERE proposal_id = ?"
+              ).bind(nowStr, log.target_id).run();
+            }
+
+            // 标记为已拒绝
+            await env.DB.prepare(
+              "UPDATE admin_operation_log SET reviewed_at = ?, reason = ? WHERE id = ?"
+            ).bind(nowStr, `[复核拒绝] ${rejectReason || '无'}`, auditLogId).run();
+
+            return jsonResponse({
+              success: true,
+              message: "复核已拒绝，操作已回滚"
+            });
+          }
+        }
+
+        // 3.11 GET /api/admin/pending-reviews
+        // 获取待复核的操作列表
+        if (pathname === "/api/admin/pending-reviews" && request.method === "GET") {
+          const url = new URL(request.url);
+          const reviewerId = url.searchParams.get('reviewerId');
+
+          if (!reviewerId) {
+            return jsonResponse({ error: "缺少复核人ID" }, 400);
+          }
+
+          const results = await env.DB.prepare(`
+            SELECT * FROM admin_operation_log
+            WHERE reviewer_id = ? AND reviewed_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 50
+          `).bind(reviewerId).all();
+
+          return jsonResponse({
+            success: true,
+            reviews: results.results || [],
+            total: results.results?.length || 0
+          });
+        }
+
+        // 3.12 GET /api/admin/audit-log
         // 查询审计日志
         if (pathname === "/api/admin/audit-log" && request.method === "GET") {
           const url = new URL(request.url);
