@@ -639,6 +639,94 @@ export default {
           });
         }
 
+        // 3.5 POST /api/admin/upload-material
+        // 代客户补充材料 (Level 0 - 所有管理员可用)
+        if (pathname === "/api/admin/upload-material" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const { proposalId, operatorId, operatorRole, materialType, materialNote } = payload;
+
+          if (!proposalId) return jsonResponse({ error: "缺少投保单号" }, 400);
+          if (!operatorId) return jsonResponse({ error: "缺少操作人ID" }, 400);
+          if (!operatorRole || !['CS', 'L1', 'L2', 'L3'].includes(operatorRole)) {
+            return jsonResponse({ error: "无效的操作角色" }, 400);
+          }
+          if (!materialType) return jsonResponse({ error: "请选择材料类型" }, 400);
+
+          // 查询投保单
+          const proposal = await env.DB.prepare(
+            "SELECT proposal_id, proposal_status FROM proposal WHERE proposal_id = ?"
+          ).bind(proposalId).first<any>();
+
+          if (!proposal) {
+            return jsonResponse({ error: "投保单不存在" }, 404);
+          }
+
+          const beforeState = { proposal_status: proposal.proposal_status };
+          const afterState = {
+            proposal_status: proposal.proposal_status,
+            material_uploaded: true,
+            material_type: materialType
+          };
+
+          const logId = `AOL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+            INSERT INTO admin_operation_log (
+              id, operator_id, operator_role, power_type, action,
+              target_type, target_id, reason, before_state, after_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            logId,
+            operatorId,
+            operatorRole,
+            'SUBSTITUTION',
+            'UPLOAD_MATERIAL',
+            'PROPOSAL',
+            proposalId,
+            materialNote || '代客户补充材料',
+            JSON.stringify(beforeState),
+            JSON.stringify(afterState)
+          ).run();
+
+          return jsonResponse({
+            success: true,
+            auditLogId: logId,
+            message: "材料补充记录已保存"
+          });
+        }
+
+        // 3.6 GET /api/admin/audit-log
+        // 查询审计日志
+        if (pathname === "/api/admin/audit-log" && request.method === "GET") {
+          const url = new URL(request.url);
+          const proposalId = url.searchParams.get('proposalId');
+          const operatorId = url.searchParams.get('operatorId');
+          const limit = parseInt(url.searchParams.get('limit') || '50');
+
+          let query = "SELECT * FROM admin_operation_log WHERE 1=1";
+          const params: any[] = [];
+
+          if (proposalId) {
+            query += " AND target_id = ?";
+            params.push(proposalId);
+          }
+          if (operatorId) {
+            query += " AND operator_id = ?";
+            params.push(operatorId);
+          }
+
+          query += " ORDER BY created_at DESC LIMIT ?";
+          params.push(limit);
+
+          const stmt = env.DB.prepare(query);
+          const results = await stmt.bind(...params).all();
+
+          return jsonResponse({
+            success: true,
+            logs: results.results || [],
+            total: results.results?.length || 0
+          });
+        }
+
         // 4. Underwriting Decision (Manual)
         // POST /api/underwriting/decision
         // - Allow modification of ALL time fields
