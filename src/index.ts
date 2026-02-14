@@ -552,6 +552,93 @@ export default {
           });
         }
 
+        // 3.4 POST /api/admin/substitute-auth
+        // L1+ 管理员代客户完成身份认证（代行权）
+        if (pathname === "/api/admin/substitute-auth" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as any;
+          const { proposalId, operatorId, operatorRole, verificationMethod, reason } = payload;
+
+          // 1. 参数校验
+          if (!proposalId) return jsonResponse({ error: "缺少投保单号" }, 400);
+          if (!operatorId) return jsonResponse({ error: "缺少操作人ID" }, 400);
+          if (!operatorRole || !['L1', 'L2', 'L3'].includes(operatorRole)) {
+            return jsonResponse({ error: "无权限：仅 L1 及以上角色可执行此操作" }, 403);
+          }
+          if (!verificationMethod || !['PHONE', 'VIDEO', 'IN_PERSON'].includes(verificationMethod)) {
+            return jsonResponse({ error: "请选择身份核实方式" }, 400);
+          }
+          if (!reason || reason.trim().length < 10) {
+            return jsonResponse({ error: "操作理由至少需要10个字符" }, 400);
+          }
+
+          // 2. 查询投保单当前状态
+          const proposal = await env.DB.prepare(
+            "SELECT proposal_id, proposal_status FROM proposal WHERE proposal_id = ?"
+          ).bind(proposalId).first<any>();
+
+          if (!proposal) {
+            return jsonResponse({ error: "投保单不存在" }, 404);
+          }
+
+          // 3. 查询核保决策记录
+          const decision = await env.DB.prepare(`
+            SELECT decision_id, underwriting_risk_acceptance, auth_code, owner_mobile
+            FROM underwriting_manual_decision
+            WHERE proposal_id = ?
+            ORDER BY underwriting_confirmed_at DESC
+            LIMIT 1
+          `).bind(proposalId).first<any>();
+
+          if (!decision || decision.underwriting_risk_acceptance !== 'ACCEPT') {
+            return jsonResponse({ error: "只有核保通过的投保单才能代完成认证" }, 400);
+          }
+
+          // 4. 构建 before_state
+          const beforeState = {
+            proposal_status: proposal.proposal_status,
+            auth_code: decision.auth_code,
+            auth_completed_by: null
+          };
+
+          // 5. 构建 after_state
+          const nowStr = now();
+          const afterState = {
+            proposal_status: proposal.proposal_status,
+            auth_code: decision.auth_code,
+            auth_completed_by: operatorId,
+            auth_completed_at: nowStr,
+            auth_completed_method: verificationMethod
+          };
+
+          // 6. 写入审计日志
+          const logId = `AOL-${crypto.randomUUID()}`;
+          await env.DB.prepare(`
+            INSERT INTO admin_operation_log (
+              id, operator_id, operator_role, power_type, action,
+              target_type, target_id, verification_method, reason,
+              before_state, after_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            logId,
+            operatorId,
+            operatorRole,
+            'SUBSTITUTION',
+            'COMPLETE_AUTH',
+            'PROPOSAL',
+            proposalId,
+            verificationMethod,
+            reason.trim(),
+            JSON.stringify(beforeState),
+            JSON.stringify(afterState)
+          ).run();
+
+          return jsonResponse({
+            success: true,
+            auditLogId: logId,
+            message: "已代客户完成身份认证"
+          });
+        }
+
         // 4. Underwriting Decision (Manual)
         // POST /api/underwriting/decision
         // - Allow modification of ALL time fields
