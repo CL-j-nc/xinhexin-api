@@ -6,7 +6,7 @@ import { handleDocumentCenterRoutes } from "./api/document-center";
 
 import { handleCustomerServiceRoutes } from "./api/customer-service";
 import { generateAuthCode, calculateExpiresAt, normalizePhone, upsertPhoneAuthLimit, now, getPhoneAuthLimit } from "./utils/auth";
-import { jsonResponse } from "./utils/response"; // Assuming jsonResponse is in a utils/response.ts
+import { jsonResponse } from "./utils/response";
 
 export interface Env {
   DB: D1Database;
@@ -52,13 +52,6 @@ let cachedTable: TableKind | null = null;
 let draftTableReady = false;
 let proposalCoreSchemaReady = false;
 
-// corsHeaders needs to be defined if not globally available
-const corsHeaders = () => ({
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-});
-
 export default {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
@@ -92,7 +85,7 @@ export default {
         if (documentResponse) return documentResponse;
 
         // 客服中心路由
-        const customerServiceResponse = await handleCustomerServiceRoutes(request, pathname); // Removed 'env' due to mismatch in types in original code, assuming handleCustomerServiceRoutes needs only request and pathname based on other handlers
+        const customerServiceResponse = await handleCustomerServiceRoutes(request, env, pathname);
         if (customerServiceResponse) return customerServiceResponse;
 
         // ==================== PHONE AUTHENTICATION ROUTES ====================
