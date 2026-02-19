@@ -10,3 +10,7 @@ database_id = "c4608b9e-5ae1-4717-a2de-b70f046f9eb6"
 [[kv_namespaces]]
 binding = "POLICY_KV"
 id = "8687c597a13548f58c7236090ad56287"
+
+[observability]
+logs = { enabled = true, invocation_logs = true }
+traces = { enabled = true }
