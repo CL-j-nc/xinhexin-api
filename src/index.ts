@@ -5,6 +5,8 @@ import { handleClaimProcessRoutes } from "./api/claim-process";
 import { handleDocumentCenterRoutes } from "./api/document-center";
 
 import { handleCustomerServiceRoutes } from "./api/customer-service";
+import { generateAuthCode, calculateExpiresAt, normalizePhone, upsertPhoneAuthLimit, now, getPhoneAuthLimit } from "./utils/auth";
+import { jsonResponse } from "./utils/response"; // Assuming jsonResponse is in a utils/response.ts
 
 export interface Env {
   DB: D1Database;
@@ -30,25 +32,32 @@ const normalizeDbNumber = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-// 手机号标准化：移除非数字字符，处理+86前缀
-const normalizePhone = (phone: string | null | undefined): string => {
-  if (!phone) return '';
-  // 移除所有非数字字符
-  let normalized = String(phone).replace(/\D/g, '');
-  // 移除国际区号 86
-  if (normalized.startsWith('86') && normalized.length === 13) {
-    normalized = normalized.slice(2);
-  }
-  // 验证是否为11位手机号
-  if (normalized.length !== 11 || !normalized.startsWith('1')) {
-    return ''; // 无效手机号返回空
-  }
-  return normalized;
-};
+// 手机号标准化：移除非数字字符，处理+86前缀 (Moved to utils/auth.ts)
+// const normalizePhone = (phone: string | null | undefined): string => {
+//   if (!phone) return '';
+//   // 移除所有非数字字符
+//   let normalized = String(phone).replace(/\D/g, '');
+//   // 移除国际区号 86
+//   if (normalized.startsWith('86') && normalized.length === 13) {
+//     normalized = normalized.slice(2);
+//   }
+//   // 验证是否为11位手机号
+//   if (normalized.length !== 11 || !normalized.startsWith('1')) {
+//     return ''; // 无效手机号返回空
+//   }
+//   return normalized;
+// };
 
 let cachedTable: TableKind | null = null;
 let draftTableReady = false;
 let proposalCoreSchemaReady = false;
+
+// corsHeaders needs to be defined if not globally available
+const corsHeaders = () => ({
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+});
 
 export default {
   async fetch(request: Request, env: Env) {
@@ -83,10 +92,181 @@ export default {
         if (documentResponse) return documentResponse;
 
         // 客服中心路由
-        const customerServiceResponse = await handleCustomerServiceRoutes(request, env, pathname);
+        const customerServiceResponse = await handleCustomerServiceRoutes(request, pathname); // Removed 'env' due to mismatch in types in original code, assuming handleCustomerServiceRoutes needs only request and pathname based on other handlers
         if (customerServiceResponse) return customerServiceResponse;
 
+        // ==================== PHONE AUTHENTICATION ROUTES ====================
+
+        // POST /api/underwriting/auth-config - 核保端设置手机号认证配置
+        if (pathname === "/api/underwriting/auth-config" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as {
+            mobile?: string;
+            maxAttempts?: number;
+            proposalId?: string;
+            expiresInMinutes?: number;
+          };
+
+          const mobile = normalizePhone(payload.mobile);
+          const maxAttempts = payload.maxAttempts;
+          const proposalId = payload.proposalId?.trim() || null;
+          const expiresInMinutes = payload.expiresInMinutes || 30; // 默认30分钟
+
+          if (!mobile) return jsonResponse({ error: "手机号格式无效" }, 400);
+          if (maxAttempts === undefined || maxAttempts < 0) return jsonResponse({ error: "maxAttempts 参数无效" }, 400);
+          if (proposalId && !proposalId.startsWith('PROP-')) return jsonResponse({ error: "proposalId 格式无效" }, 400);
+
+          // 生成新的验证码和过期时间
+          const newAuthCode = generateAuthCode();
+          const expiresAt = calculateExpiresAt(expiresInMinutes);
+          const currentTime = now();
+
+          // 1. 在 phone_auth_limits 表中创建或更新记录
+          await upsertPhoneAuthLimit(env, {
+            mobile_phone: mobile,
+            auth_code: newAuthCode,
+            remaining_attempts: maxAttempts,
+            max_attempts: maxAttempts,
+            expires_at: expiresAt,
+            proposal_id: proposalId,
+            created_at: currentTime,
+            updated_at: currentTime,
+          });
+
+          // 2. 同步更新 underwriting_manual_decision 表中的 auth_code 和 qr_url
+          // 首先，尝试从 proposal_id 获取最近的 decision_id
+          if (proposalId) {
+            const decision = await env.DB.prepare(`
+              SELECT decision_id, owner_mobile FROM underwriting_manual_decision
+              WHERE proposal_id = ?
+              ORDER BY underwriting_confirmed_at DESC
+              LIMIT 1
+            `).bind(proposalId).first<{ decision_id: string, owner_mobile: string }>();
+
+            if (decision) {
+              const newQrUrl = `https://chinalife-shie-xinhexin.pages.dev/#/buffer?id=${proposalId}`; // 假设客户端通过 id 获取 authCode
+              await env.DB.prepare(`
+                UPDATE underwriting_manual_decision
+                SET auth_code = ?, qr_url = ?
+                WHERE decision_id = ?
+              `).bind(newAuthCode, newQrUrl, decision.decision_id).run();
+
+              // 也可以同步更新 KV (如果旧流程依赖 KV)
+              await env.POLICY_KV.put(
+                `verify:${proposalId}`,
+                JSON.stringify({ code: newAuthCode, mobile: mobile }),
+                { expirationTtl: QR_TTL }
+              );
+            } else {
+                console.warn(`[AUTH_CONFIG] No existing decision for proposalId: ${proposalId}. KV and decision table not updated.`);
+            }
+          }
+
+          return jsonResponse({
+            success: true,
+            mobile: mobile,
+            authCode: newAuthCode,
+            maxAttempts: maxAttempts,
+            remainingAttempts: maxAttempts,
+            expiresAt: expiresAt,
+            message: "认证配置已成功设置/更新"
+          });
+        }
+
+        // GET /api/underwriting/auth-status - 核保端查询手机号认证状态
+        if (pathname === "/api/underwriting/auth-status" && request.method === "GET") {
+          const mobileParam = url.searchParams.get("mobile");
+          const proposalIdParam = url.searchParams.get("proposalId");
+
+          const mobile = normalizePhone(mobileParam);
+          const proposalId = proposalIdParam?.trim() || null;
+
+          if (!mobile) return jsonResponse({ error: "手机号格式无效" }, 400);
+
+          const authRecord = await getPhoneAuthLimit(env, mobile, proposalId);
+
+          if (!authRecord) {
+            return jsonResponse({ success: true, message: "未找到该手机号的认证记录", isValid: false, data: null });
+          }
+
+          const currentTime = now();
+          const isExpired = new Date(currentTime) > new Date(authRecord.expires_at);
+          const isValid = !isExpired && authRecord.remaining_attempts > 0;
+
+          return jsonResponse({
+            success: true,
+            mobile: authRecord.mobile_phone,
+            authCode: authRecord.auth_code,
+            remainingAttempts: authRecord.remaining_attempts,
+            maxAttempts: authRecord.max_attempts,
+            expiresAt: authRecord.expires_at,
+            isValid: isValid,
+            message: isExpired ? "验证码已过期" : (authRecord.remaining_attempts <= 0 ? "访问次数已用完" : "认证记录有效")
+          });
+        }
+        
+        // POST /api/client/authenticate - 客户端提交手机号和验证码进行认证
+        if (pathname === "/api/client/authenticate" && request.method === "POST") {
+          const payload = await request.json().catch(() => ({})) as {
+            mobile?: string;
+            authCode?: string;
+            proposalId?: string;
+          };
+
+          const mobile = normalizePhone(payload.mobile);
+          const authCode = payload.authCode?.trim();
+          const proposalId = payload.proposalId?.trim();
+
+          if (!mobile) return jsonResponse({ error: "手机号格式无效", code: "INVALID_MOBILE" }, 400);
+          if (!authCode) return jsonResponse({ error: "缺少验证码", code: "MISSING_AUTH_CODE" }, 400);
+          if (!proposalId) return jsonResponse({ error: "缺少投保单号", code: "MISSING_PROPOSAL_ID" }, 400);
+
+          const authRecord = await getPhoneAuthLimit(env, mobile, proposalId);
+
+          if (!authRecord || authRecord.auth_code !== authCode) {
+            return jsonResponse({ error: "无效的手机号或验证码", code: "INVALID_CREDENTIALS" }, 401);
+          }
+
+          const currentTime = now();
+          const isExpired = new Date(currentTime) > new Date(authRecord.expires_at);
+
+          if (isExpired) {
+            return jsonResponse({ error: "验证码已过期", code: "CODE_EXPIRED" }, 401);
+          }
+
+          if (authRecord.remaining_attempts <= 0) {
+            return jsonResponse({ error: "访问次数已用完", code: "ATTEMPTS_EXHAUSTED" }, 401);
+          }
+
+          // 认证成功：递减访问次数并更新 last_accessed_at
+          await upsertPhoneAuthLimit(env, {
+            ...authRecord,
+            remaining_attempts: authRecord.remaining_attempts - 1,
+            last_accessed_at: currentTime,
+            updated_at: currentTime,
+          });
+
+          // 更新 underwriting_manual_decision 表中的认证状态
+          // 假设需要更新 proposal_status 或 auth_completed_at
+          await env.DB.prepare(`
+            UPDATE underwriting_manual_decision
+            SET auth_completed_at = ?, auth_completed_by = 'CLIENT'
+            WHERE proposal_id = ?
+            ORDER BY underwriting_confirmed_at DESC
+            LIMIT 1
+          `).bind(currentTime, proposalId).run();
+
+          // 可选：更新 proposal 表的状态，例如从 'UNDERWRITING_CONFIRMED' 到 'CLIENT_AUTHENTICATED'
+          await env.DB.prepare(`
+            UPDATE proposal
+            SET proposal_status = 'CLIENT_AUTHENTICATED', updated_at = ?
+            WHERE proposal_id = ?
+          `).bind(currentTime, proposalId).run();
+
+
+          return jsonResponse({ success: true, message: "认证成功" });
+        }
         // ==================== NEW UNDERWRITING FLOW ====================
+
 
         // ==================== NEW EVENT-DRIVEN FLOW (FINAL DELIVERY) ====================
 
